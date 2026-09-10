@@ -1,0 +1,77 @@
+/* S70 Recovery -- TUI styling.
+
+   Colour carries meaning and nothing else: green means both checks passed,
+   yellow means something could not be verified, red means a check failed.
+   Nothing is red for emphasis. */
+
+Screen {
+    background: $surface;
+}
+
+#consent-body {
+    padding: 1 2;
+}
+
+.panel {
+    border: round $primary;
+    padding: 1 2;
+    margin: 1 0;
+}
+
+.danger {
+    border: round $error;
+    padding: 1 2;
+    margin: 1 0;
+}
+
+.caution {
+    border: round $warning;
+    padding: 1 2;
+    margin: 1 0;
+}
+
+.muted {
+    color: $text-muted;
+    padding: 0 2;
+}
+
+.heading {
+    text-style: bold;
+    margin-top: 1;
+    padding: 0 2;
+}
+
+#consent-input {
+    margin: 1 0;
+}
+
+#inventory-table {
+    height: 1fr;
+}
+
+/* The key itself gets a hard border, so it is unmistakable which text on
+   screen is the secret. */
+#secret-block {
+    border: heavy $warning;
+    padding: 1 2;
+    margin: 1 0;
+    background: $panel;
+}
+
+#secret-block.revealed {
+    border: heavy $error;
+}
+
+KeystorePrompt {
+    align: center middle;
+}
+
+#keystore-dialog {
+    width: 70;
+    height: auto;
+    background: $surface;
+}
+
+DataTable > .datatable--cursor {
+    background: $accent;
+}

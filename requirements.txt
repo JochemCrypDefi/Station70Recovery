@@ -1,0 +1,15 @@
+# Core recovery tool. This is all you need to decrypt keys and produce
+# wallet-extension import strings.
+#
+# Offline install: on an internet-connected machine run
+#     pip download -r requirements.txt -d wheels --platform win_amd64 \
+#         --python-version 312 --only-binary :all:
+# copy the `wheels` directory across, then on the air-gapped machine
+#     pip install --no-index --find-links wheels -r requirements.txt
+
+cryptography>=42.0
+pycryptodome>=3.20
+pynacl>=1.5
+textual>=0.79
+rich>=13.7
+segno>=1.6

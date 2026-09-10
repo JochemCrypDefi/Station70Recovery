@@ -1,0 +1,23 @@
+# NEVER commit recovery material.
+*.json
+!package.json
+backup-*.json
+*.pem
+*.der
+*.key
+keystore-*.json
+job-*.json
+signed-*.json
+signed-*.txt
+out/
+wheels/
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+*.egg-info/
+build/
+dist/
+.pytest_cache/
