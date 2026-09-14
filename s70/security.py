@@ -8,7 +8,6 @@ does is remove the easy, avoidable leaks:
 * secrets that end up in terminal scrollback and get screenshotted
 * secrets that end up in a clipboard manager's on-disk history
 
-The threat model is written out in ``docs/THREAT-MODEL.md``.
 """
 
 from __future__ import annotations

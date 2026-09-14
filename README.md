@@ -10,8 +10,7 @@ It does four things:
 2. **Checks each key two ways** and tells you plainly which checks passed.
 3. **Shows each key in the format your wallet wants**, with the click path to
    import it.
-4. **Exports a key to AWS KMS** if you want signing to happen there instead —
-   the only route for the chains no extension will take.
+4. **Exports a key to AWS KMS** if you want to migrate there for moving the funds.
 
 **It runs entirely offline and opens no network connections.**
 
@@ -30,13 +29,9 @@ It does four things:
 - [Using a recovered key](#using-a-recovered-key)
 - [What's supported](#whats-supported)
 - [How keys are verified](#how-keys-are-verified)
-- [Before you trust it with real money](#before-you-trust-it-with-real-money)
-- [Troubleshooting](#troubleshooting)
 
-Also: [your backup file](docs/FORMAT.md) ·
-[importing into a wallet](docs/IMPORT-GUIDE.md) ·
-[exporting to AWS KMS](docs/KMS-EXPORT.md) ·
-[staying safe](docs/THREAT-MODEL.md)
+Also: [importing into a wallet](docs/IMPORT-GUIDE.md) ·
+[exporting to AWS KMS](docs/KMS-EXPORT.md)
 
 ---
 
@@ -45,32 +40,24 @@ Also: [your backup file](docs/FORMAT.md) ·
 Requires **Python 3.10+**.
 
 ```bash
-git clone <this repo> s70-recovery
-cd s70-recovery
-
 python -m venv .venv
-# Windows PowerShell:
-.venv\Scripts\Activate.ps1
-# macOS / Linux:
 source .venv/bin/activate
 
 pip install -r requirements.txt
 pip install -e .            # gives you the `s70` command
 ```
 
-> **Windows:** if `python --version` offers to install from the Microsoft
-> Store, you don't have a real interpreter yet. Install one first —
-> `winget install Python.Python.3.12`, or python.org with **Add python.exe to
-> PATH** ticked.
-
 ### Installing on an offline machine
 
-On a machine with internet, download the packages — including the build tools,
+On a machine with internet, download the packages, including the build tools,
 which an offline install cannot fetch later:
 
 ```bash
 pip download -r requirements.txt -d wheels \
-    --platform win_amd64 --python-version 312 --only-binary :all:
+    --platform manylinux2014_x86_64 \
+    --platform manylinux_2_17_x86_64 \
+    --platform manylinux_2_28_x86_64 \
+    --python-version 312 --only-binary :all:
 pip download setuptools wheel -d wheels
 ```
 
@@ -81,10 +68,6 @@ Copy the `wheels` folder and this repository across, then:
 pip install --no-index --find-links wheels -r requirements.txt
 pip install --no-index --no-build-isolation --no-deps -e .
 ```
-
-There is nothing else to install. `requirements.txt` is the whole tool. It
-pulls in no AWS SDK and no chain SDKs, which is part of why the tool cannot
-reach the network even if something asked it to.
 
 ---
 
@@ -103,9 +86,6 @@ s70 verify backup-2026-09-08T04_15_08.678372Z.json
 # 3. Recover keys and get the strings to paste into your wallet.
 s70 tui backup-2026-09-08T04_15_08.678372Z.json
 ```
-
-There is nothing else to supply — no passphrase, no separate key file. The
-backup carries its own recovery key.
 
 ---
 
@@ -134,18 +114,17 @@ shows the chain, the address, and both verification results.
 
 **Wallet screen.** Three parts:
 
-- **Private key** — the key in every format your wallet might accept, the
+- **Private key** - the key in every format your wallet might accept, the
   right one first and marked `<-- paste this one`. Hidden until you press `r`.
-- **How to import** — the click path for the wallet that takes this key, or,
+- **How to import** - the click path for the wallet that takes this key, or,
   where no wallet will take it, what to do instead.
-- **Sign with AWS KMS** — the `s70 kms-export` command for this account,
+- **Sign with AWS KMS** - the `s70 kms-export` command for this account,
   ready to copy, and the KMS key spec it needs.
 
 Leaving the screen discards the key.
 
 Keys are hidden by default and never printed outside the app, so nothing ends
-up in your terminal scrollback. Copying to the clipboard is your call —
-[the trade-off is here](docs/THREAT-MODEL.md#what-it-cannot-protect-you-from).
+up in your terminal scrollback. Copying to the clipboard is your call.
 
 ---
 
@@ -185,9 +164,6 @@ Per-wallet instructions: [docs/IMPORT-GUIDE.md](docs/IMPORT-GUIDE.md).
 
 ### Export the key to AWS KMS
 
-For XRPL — which no wallet can import these keys into — and for anywhere you'd
-rather not put a private key in a browser at all.
-
 You import the key into KMS once; after that KMS holds it and signs with it.
 Every wallet in the backup can go this route, because KMS takes both curves:
 `ECC_SECG_P256K1` for secp256k1 and `ECC_NIST_EDWARDS25519` for Ed25519.
@@ -198,21 +174,18 @@ Every wallet in the backup can go this route, because KMS takes both curves:
   get-parameters-for-import ──▶ (wraps the key)          ──▶  get-public-key
        │  import-parameters.json         │  EncryptedKeyMaterial.bin
        │                                 │  ImportToken.bin
-       └────────── USB stick ────────────┴───────── USB stick ─────────▶
+       └────────── USB drive ────────────┴───────── USB drive ─────────▶
 ```
 
 ```bash
 s70 kms-prepare backup.json --wallet 27          # what to create; decrypts nothing
 # ... create the key and fetch its import parameters online ...
-s70 kms-export --backup backup.json --wallet 27 \
-  --params import-parameters.json --out EncryptedKeyMaterial.bin
+s70 kms-export --backup backup.json --wallet 27 --params import-parameters.json --out EncryptedKeyMaterial.bin
 ```
 
 `kms-prepare` prints the two online commands you need before you start.
 `kms-export` wraps the key, writes `EncryptedKeyMaterial.bin` and
-`ImportToken.bin` side by side, and prints only the commands you have left —
-including a fingerprint of the public key, so you can prove the material
-landed on the right KMS key. Carry both files across, into the same directory.
+`ImportToken.bin` side by side, and prints the commands you have left.
 
 Two things to know before you start:
 
@@ -237,37 +210,33 @@ Full walkthrough, key specs and failure modes:
 | Sui | Suiet | `suiprivkey1…` | yes | either, by key |
 | Stellar | Freighter | `S…` | yes | `ECC_NIST_EDWARDS25519` |
 | Polkadot | Talisman | keystore file | yes | `ECC_NIST_EDWARDS25519` |
-| XRPL | **none** | — | yes | either, by key |
+| XRPL | - | - | yes | either, by key |
 | Canton | Console Wallet | no known path | yes | `ECC_NIST_EDWARDS25519` |
-| Radix | — | raw key only | no | by key |
+| Radix | - | raw key only | no | by key |
 
-Every key can be exported to KMS — that column is which key spec to create,
+Every key can be exported to KMS - that column is which key spec to create,
 and `s70 kms-prepare` will tell you per wallet. The address-checked column is
 about this tool's own verification, not about whether the key works.
 
-Three cases need a word of warning:
+Three cases need an extra word:
 
 **Polkadot.** Talisman can't take a pasted Substrate key, so the app writes a
 polkadot-js keystore file instead (press `k`). You choose a password and
-Talisman asks for the same one. Delete the file once the import worked. If the
-address check didn't pass, the app **refuses** to write the file — see
-`mismatch` under [Troubleshooting](#troubleshooting).
+Talisman asks for the same one. Delete the file once the import worked.
 
-**XRPL.** No wallet extension can import these keys — they all want a 16-byte
+**XRPL.** No wallet extension can import these keys - they all want a 16-byte
 seed, and the backup holds the 32-byte key derived from it, which can't be
-reversed. [Export it to AWS KMS](docs/KMS-EXPORT.md) and sign there; KMS takes
-both curves XRPL uses.
+reversed. [Export it to AWS KMS](docs/KMS-EXPORT.md) and sign there.
 
 **Radix.** The tool has no address derivation for Radix, so those keys show as
 `sha-256 only`. The key itself is still recovered and shown, and its checksum
-is still verified — you just have to confirm the address in your wallet.
+is still verified - you just have to confirm the address in your wallet.
 
 ---
 
 ## How keys are verified
 
-Every recovered key is checked two ways, and both results are shown
-separately, because they mean different things.
+Every recovered key is checked two ways.
 
 **1. Checksum.** The backup records a hash of the original key. The tool
 hashes what it decrypted and compares. This catches corruption and a wrong
@@ -285,95 +254,5 @@ actually controls the account.
 | `ambiguous` | The address could belong to several chains and the key matched none. |
 | `no address` | Your backup recorded no address to compare against. |
 | `HASH MISMATCH` | The checksum failed. Don't trust the key. |
-| `not recovered` | Nothing has been decrypted yet — the state every wallet is in under `s70 list`. |
+| `not recovered` | Nothing has been decrypted yet - the state every wallet is in under `s70 list`. |
 | `error` | This wallet could not be decrypted at all. The message says why. |
-
-Anything other than `verified` means the key was **not** proved to control the
-address printed beside it, and the tool says so on the wallet screen rather
-than leaving you to infer it from the status word.
-
-A key on a chain the tool can't verify is **never withheld** — the key is what
-you came for, and the missing check is shown alongside it. Confirm the address
-in your wallet after importing.
-
-More on the file itself: [docs/FORMAT.md](docs/FORMAT.md).
-
----
-
-## Before you trust it with real money
-
-```bash
-pip install pytest
-pytest -q
-```
-
-The tests prove the tool is internally consistent — they can't prove an
-address derivation matches what a chain really does. A subtly wrong derivation
-would be consistently wrong and the tests would pass anyway.
-
-So do the check that actually counts: **recover one key, import it, and
-confirm the wallet shows the address you expected.**
-
-Known-weaker areas, stated plainly:
-
-- **Aptos newer-style accounts** — the classic derivation is solid; for the
-  newer scheme several variants are tried and any match accepted.
-- **Canton** — the party-id fingerprint derivation is reconstructed from a
-  single real account, not from published documentation. A match proves the
-  key; a `mismatch` may just mean your party uses a scheme this tool doesn't
-  know, so check with your node operator before concluding anything.
-- **Radix** — no address derivation at all.
-- **Petra and the `ed25519-priv-0x…` format** — unverified whether Petra
-  accepts it. Plain hex is offered first.
-
-Security details and what the tool can't protect you from:
-[docs/THREAT-MODEL.md](docs/THREAT-MODEL.md).
-
----
-
-## Troubleshooting
-
-**`<file> has no 'recovery_key' field`** — every Station70 backup embeds the
-key that decrypts it. A file without one is truncated, or isn't a Station70
-backup.
-
-**`the 'recovery_key' embedded in <file> is not the key its wallets were
-encrypted to`** — the backup records which key it was encrypted to, and the one
-inside the file isn't it. The file has been edited, or two backups have been
-spliced together. Use the original.
-
-**`recovery_key is not valid base64`** — the field should be base64. A PEM
-block pasted in directly also works.
-
-**`ciphertext is N bytes but the recovery key is RSA-4096`** — that wallet was
-encrypted for a different backup. Check you have the right file.
-
-**`RSA-OAEP decryption failed for every hash combination tried`** — the
-recovery key doesn't match this backup, or the file is corrupt.
-
-**`decrypted N bytes, which does not match any known private-key encoding`** —
-the key decrypted but isn't in a shape the tool recognises. Report the length;
-don't assume the key is lost.
-
-**Status is `mismatch`** — the address check ran and the key opened a
-different address. Three known causes that aren't a broken key: on **Aptos**,
-the key may have been rotated, in which case it can still be the account's
-current key — check an explorer. On **Polkadot**, it usually means the account
-is sr25519, which this tool cannot rebuild; the app refuses to write a keystore
-in that case, and you should not send funds to any address it would produce. On
-**Canton**, it may mean your party uses a fingerprint scheme this tool doesn't
-know — ask your node operator.
-
-**Status is `HASH MISMATCH`** — the decrypted bytes don't match the checksum
-the backup recorded for them. This is the one failure that means *don't use
-this key*: the ciphertext is damaged. `s70 verify` counts these separately from
-`mismatch` and exits non-zero. Nothing about the address check changes this.
-
-**Status is `sha-256 only`** — the key is fine, the tool just can't derive
-that chain's address. Confirm the address in your wallet before moving
-anything.
-
-**The app refuses to write a Polkadot keystore** — the key does not produce the
-address recorded in the backup, so the file would import a *different* account.
-Almost always an sr25519 account. The raw seed is still shown on screen if you
-have other tooling for it.
