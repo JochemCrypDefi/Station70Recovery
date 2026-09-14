@@ -17,6 +17,8 @@ open it.
 
 from __future__ import annotations
 
+import textwrap
+
 from rich.markup import escape
 from rich.text import Text
 from textual.app import App, ComposeResult
@@ -26,23 +28,31 @@ from textual.screen import ModalScreen, Screen
 from textual.widgets import DataTable, Footer, Header, Input, Label, Static
 
 from s70 import backup as backup_mod
-from s70 import security, txn, wallets
-from s70.chains import Status
+from s70 import kms, security, wallets
 from s70.errors import S70Error
 from s70.session import RecoverySession, WalletRecord
 
 CONSENT_PHRASE = "RECOVER"
 
+
+def _wrap(text: str, *, indent: str = "  ", width: int = 78) -> str:
+    """Wrap prose for a fixed-width block, escaped for rich markup."""
+    return textwrap.fill(
+        escape(text), width=width, initial_indent=indent, subsequent_indent=indent
+    )
+
+#: Mirrors ``STATUS_STYLES`` in :mod:`s70.cli`: same keys, same colours, same
+#: words. A status must not read one way in the app and another on the command
+#: line.
 STATUS_MARKUP = {
     "verified": "[green]verified[/]",
-    "unverifiable": "[yellow]unverifiable[/]",
     "mismatch": "[red]mismatch[/]",
     "ambiguous": "[yellow]ambiguous[/]",
-    "unsupported": "[dim]sha-256 only[/]",
-    "no-address": "[yellow]no address[/]",
+    "sha-256 only": "[cyan]sha-256 only[/]",
+    "no address": "[yellow]no address[/]",
     "error": "[red]error[/]",
     "HASH MISMATCH": "[bold red]HASH MISMATCH[/]",
-    "not recovered": "[dim]-[/]",
+    "not recovered": "[dim]not recovered[/]",
 }
 
 
@@ -179,7 +189,7 @@ class InventoryScreen(Screen):
 
 
 class WalletScreen(Screen):
-    """One wallet: the key, how to import it, and how to sweep it."""
+    """One wallet: the key, how to import it, and how to get it into KMS."""
 
     BINDINGS = [
         Binding("r", "toggle_reveal", "Reveal / hide"),
@@ -196,21 +206,44 @@ class WalletScreen(Screen):
             record.chain,
             record.key,
             record.chain_label,
-            address_verified=record.verified_for_signing,
+            address_proved=record.address_proved,
         )
-        # (label, value, note) -- the raw bytes first, then the encodings the
-        # extensions actually ask for. Deduplicated by value: several chains
-        # hand back bare hex as their import format too, and showing the same
-        # string twice under two names invites pasting the wrong one.
-        self.entries: list[tuple[str, str, str]] = []
+        self.entries = self._build_entries()
+
+    def _build_entries(self) -> list[tuple[str, str, str]]:
+        """``(label, value, note)`` in the order the user should try them.
+
+        The format the target wallet actually wants comes first and is marked,
+        so the obvious thing to paste is the right thing to paste. Raw hex goes
+        last: it is the fallback for when no extension will take the key, and
+        leading with it once put a string Stellar categorically rejects above
+        the ``S...`` secret Freighter wants.
+
+        Deduplicated by value, because several chains hand back bare hex as
+        their import format too and showing one string twice under two names
+        invites pasting the wrong one. The *builder's* entry wins a collision:
+        it carries the label and the note that explain the string, and the
+        generic fallback carries neither.
+        """
+        entries: list[tuple[str, str, str]] = []
         seen: set[str] = set()
-        candidates = [("Raw private key (hex)", record.key.scalar.reveal().hex(), "")]
-        candidates += [(f.label, f.value, f.note) for f in self.guide.formats]
-        for label, value, note in candidates:
-            if value in seen:
+        # `primary` marks the format the target wallet actually accepts.
+        for fmt in sorted(self.guide.formats, key=lambda f: not f.primary):
+            if fmt.value in seen:
                 continue
-            seen.add(value)
-            self.entries.append((label, value, note))
+            seen.add(fmt.value)
+            entries.append((fmt.label, fmt.value, fmt.note))
+
+        raw_hex = self.record.key.scalar.reveal().hex()
+        if raw_hex not in seen:
+            entries.append(("Raw private key (hex)", raw_hex, ""))
+
+        # Point at the one to use -- but only when there is a choice to make
+        # and something can actually be pasted.
+        if len(entries) > 1 and not self.guide.blocked:
+            label, value, note = entries[0]
+            entries[0] = (f"{label}   <-- paste this one", value, note)
+        return entries
 
     # -- layout -----------------------------------------------------------
 
@@ -234,15 +267,18 @@ class WalletScreen(Screen):
             yield Label("How to import", classes="heading")
             yield Static(self._import_text(), classes="muted")
 
-            signing = self._signing_text()
-            if signing:
-                yield Label("Move the funds out", classes="heading")
-                yield Static(signing, classes="muted")
+            kms_text = self._kms_text()
+            if kms_text:
+                yield Label("Sign with AWS KMS", classes="heading")
+                yield Static(kms_text, classes="muted")
 
-            if self.guide.warnings:
+            notes = list(self.guide.warnings)
+            if record.scheme_warning:
+                notes.append(record.scheme_warning)
+            if notes:
                 yield Label("Notes", classes="heading")
                 yield Static(
-                    "\n".join(f"  - {escape(w)}" for w in self.guide.warnings),
+                    "\n".join(_wrap(f"- {note}", indent="  ") for note in notes),
                     classes="muted",
                 )
         yield Footer()
@@ -251,33 +287,50 @@ class WalletScreen(Screen):
         self._render_secret()
 
     def _import_text(self) -> str:
-        if self.guide.writes_file:
-            return "\n".join(f"  {escape(step)}" for step in self.guide.ui_path)
-        if self.guide.blocked or not self.guide.ui_path:
-            return "  Not available."
-        return f"  Into {escape(self.guide.wallet)}:\n" + "\n".join(
-            f"    {escape(step)}" for step in self.guide.ui_path
-        )
+        """The import block. Never just "Not available."
 
-    def _signing_text(self) -> str:
-        chain = self.record.chain
-        if chain is None or chain.id not in txn.SUPPORTED:
-            return ""
-        if not self.record.verified_for_signing:
-            return (
-                "  This key was not proved to control the address above, so it is not "
-                "safe to sign a sweep with it."
+        When there is no import path, *why* there is none and what to do
+        instead is the most useful thing on the screen -- for XRPL it is the
+        whole answer -- so ``guide.blocked`` is rendered rather than reduced to
+        two words.
+        """
+        lines: list[str] = []
+        if self.guide.blocked:
+            lines.append(_wrap(self.guide.blocked, indent="  "))
+        if self.guide.ui_path:
+            if not self.guide.blocked:
+                lines.append(f"  Into {escape(self.guide.wallet)}:")
+            lines.append(
+                "\n".join(f"    {escape(step)}" for step in self.guide.ui_path)
             )
+        return "\n\n".join(lines) if lines else "  No import path for this chain."
+
+    def _kms_text(self) -> str:
+        """How to put this key into AWS KMS and sign with it there.
+
+        Every key in the backup is eligible -- KMS imports both secp256k1 and
+        Ed25519 -- so this is offered unconditionally. It is the only route for
+        the chains no extension will take, which is why it is spelled out here
+        rather than left to the docs.
+        """
+        try:
+            profile = kms.profile_for_curve(self.record.key.curve)
+        except S70Error:
+            return ""
+
+        backup = escape(self.session.backup.path.name)
+        index = self.record.share.index
         return (
-            f"  This tool can build and sign a transaction that sweeps this account.\n"
-            f"  It never submits one -- you get a signed blob and the command to send it.\n\n"
-            f"  On an online machine (no keys involved):\n"
-            f"    s70 inspect --chain {chain.id} \\\n"
-            f"      --source {escape(self.record.address or '<address>')} \\\n"
-            f"      --destination <YOUR_SAFE_ADDRESS> --out job.json\n\n"
-            f"  Then, back here, offline:\n"
-            f"    s70 sign --job job.json --backup {escape(self.session.backup.path.name)}\n\n"
-            f"  The job names this account, so sign finds the right wallet itself."
+            f"  This key can be imported into AWS KMS as an {profile.key_spec} key and\n"
+            f"  used for signing there. Nothing is signed by this tool.\n\n"
+            f"  First, to see the commands that create the KMS key (no keys are read):\n"
+            f"    s70 kms-prepare {backup} --wallet {index}\n\n"
+            f"  Then, once you have brought the import parameters back here, offline:\n"
+            f"    s70 kms-export --backup {backup} --wallet {index} \\\n"
+            f"      --params import-parameters.json --out EncryptedKeyMaterial.bin\n\n"
+            f"  That writes two files: the wrapped key and the import token it has to\n"
+            f"  be paired with. Carry both back on the same USB stick -- the blob is\n"
+            f"  encrypted to AWS's own key and the token is public."
         )
 
     # -- reveal -----------------------------------------------------------
@@ -323,6 +376,20 @@ class WalletScreen(Screen):
     def action_write_keystore(self) -> None:
         if not self.guide.writes_file:
             self.notify("this chain does not use a keystore file", severity="warning")
+            return
+        if not self.record.address_proved:
+            # A keystore is the one thing here that produces a file a wallet
+            # will act on. Writing one from a key that did not re-derive the
+            # recorded address hands the user an account that is not theirs,
+            # under a filename that implies it is.
+            self.notify(
+                "refusing to write a keystore: this key does not produce the address "
+                f"in the backup ({self.record.address or '<none>'}). Importing it would "
+                "add a different account. On Polkadot this almost always means the "
+                "account is sr25519, which this tool cannot rebuild.",
+                severity="error",
+                timeout=30,
+            )
             return
         self.app.push_screen(KeystorePrompt(), self._write_keystore)
 

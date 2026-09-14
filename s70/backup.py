@@ -1,6 +1,10 @@
 """Backup file parsing.
 
-Schema, as emitted by CrypDefi (``version`` ``"1.0"``)::
+Schema of a Station70 backup file (``version`` ``"1.0"``), showing only the
+fields this module reads. Real files also carry ``organization_id``,
+``workspace_id``, ``generated_at``, ``chain_code``, ``key_id``,
+``share_algorithm`` and ``encryption.key_source``, none of which the tool
+looks at::
 
     {
       "version": "1.0",
@@ -8,23 +12,28 @@ Schema, as emitted by CrypDefi (``version`` ``"1.0"``)::
       "recovery_key": "<base64 DER RSA-4096 private key>",
       "keys": [
         {
-          "key_id": "...",
           "key_type": "EDDSA_ED25519" | "ECDSA_SECP256k1",
           "key_name": "Treasury EVM",
-          "share_algorithm": "single",
           "shares": [
             {
               "metadata": { "address": "0x...", "chain_id": "ch-60" },
               "encryption": {
                 "ciphersuite": "RSA-4096-OAEP-SHA256",
                 "ciphertext": "<base64>",
-                "original_sha256": "<base64 sha256 of plaintext>"
+                "original_sha256": "<base64 sha256 of plaintext>",
+                "public_key": "<base64 DER SPKI of the recovery key>"
               }
             }
           ]
         }
       ]
     }
+
+Every share observed so far carries the same ``encryption.public_key``: the
+public half of the file's own ``recovery_key``. :meth:`s70.session.
+RecoverySession.open` checks the two against each other, so a file whose
+embedded key cannot open it says so once, up front, instead of failing per
+wallet with an opaque padding error.
 
 Two fields carry information the tool would otherwise have to guess, and both
 are treated as authoritative:
@@ -80,6 +89,18 @@ class Share:
         return str(value) if value else None
 
     @property
+    def wrapping_public_key_b64(self) -> str | None:
+        """Base64 DER SPKI of the RSA key this share was encrypted to.
+
+        The backup records it per share; in practice it is the same value on
+        every share, and it is the public half of the file's own
+        ``recovery_key``. Checking it turns "nothing decrypts and we cannot say
+        why" into one sentence.
+        """
+        value = self.encryption.get("public_key")
+        return str(value).strip() if value else None
+
+    @property
     def address(self) -> str | None:
         value = self.metadata.get("address")
         return str(value).strip() if value else None
@@ -98,9 +119,13 @@ class Share:
 
 @dataclass(frozen=True)
 class KeyEntry:
-    """One wallet key, which may be split across several shares."""
+    """One wallet key and the encrypted share(s) carrying it.
 
-    index: int
+    Every backup seen so far has ``share_algorithm: "single"`` and exactly one
+    share per key. Nothing here recombines shares: :meth:`Backup.iter_shares`
+    flattens them, and each share becomes its own wallet in the UI.
+    """
+
     key_name: str
     shares: tuple[Share, ...]
     key_type: str = ""
@@ -142,7 +167,6 @@ class Backup:
     wallet_provider: str
     recovery_key_b64: str | None
     keys: tuple[KeyEntry, ...]
-    raw: dict[str, Any]
 
     def __repr__(self) -> str:
         return (
@@ -223,7 +247,6 @@ def load(path: str | Path) -> Backup:
 
         entries.append(
             KeyEntry(
-                index=key_index,
                 key_name=str(raw_entry.get("key_name") or ""),
                 shares=tuple(shares),
                 key_type=str(raw_entry.get("key_type") or ""),
@@ -235,15 +258,11 @@ def load(path: str | Path) -> Backup:
 
     recovery_key = document.get("recovery_key")
 
-    # Keep exactly one copy of the RSA private key, in the field that is
-    # documented to hold it. Leaving a second copy in `raw` means every
-    # incidental dump of the parsed document leaks it.
-    redacted = {k: v for k, v in document.items() if k != "recovery_key"}
-
+    # The parsed document is deliberately not retained: it holds a second copy
+    # of the RSA private key, and every incidental dump of it would leak one.
     return Backup(
         path=path,
         wallet_provider=str(document.get("wallet_provider") or "?"),
         recovery_key_b64=str(recovery_key) if recovery_key else None,
         keys=tuple(entries),
-        raw=redacted,
     )

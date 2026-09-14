@@ -9,11 +9,13 @@ marshalled differently by whatever produced the backup:
 length     shape                                      curve
 =========  =========================================  ==================
 32         raw scalar / Ed25519 seed                  ambiguous
+33         the above, with a leading zero pad         ambiguous
 48         PKCS#8 Ed25519 (``302e...04220420`` + 32)  ed25519
 64         Ed25519 seed || public key (libsodium/Go)  ed25519
-16         XRPL family-seed entropy                   ambiguous
 varies     DER PKCS#8 / SEC1 EC private key           from the OID
 =========  =========================================  ==================
+
+Any of those may also arrive ASCII-armoured as hex or base64.
 
 A bare 32-byte plaintext is genuinely ambiguous: the same bytes are a valid
 Ed25519 seed *and* a valid secp256k1 scalar. Rather than guess, we produce a
@@ -23,8 +25,8 @@ That makes the address check load-bearing rather than decorative.
 
 from __future__ import annotations
 
-import hashlib
-from dataclasses import dataclass, field
+import base64
+from dataclasses import dataclass
 from typing import Final
 
 from cryptography.hazmat.primitives import serialization
@@ -55,10 +57,6 @@ class KeyMaterial:
     #: How the plaintext was interpreted, for display and audit.
     encoding: str
     plaintext_len: int
-
-    @property
-    def public_key_hex(self) -> str:
-        return self.public_key.hex()
 
     @property
     def compressed_public_key(self) -> bytes:
@@ -151,8 +149,6 @@ def _unwrap_text_armor(plaintext: bytes) -> bytes | None:
             return None
         if len(decoded) in (16, 32, 48, 64):
             return decoded
-
-    import base64
 
     if all(c.isalnum() or c in "+/=_-" for c in text):
         for decoder in (base64.b64decode, base64.urlsafe_b64decode):

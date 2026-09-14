@@ -26,17 +26,4 @@ class SolanaChain(ChainSpec):
         return [b58.encode(key.public_key)]
 
 
-SPEC = SolanaChain(
-    id="solana",
-    label="Solana",
-    curves=(CURVE_ED25519,),
-    wallet="Phantom",
-    address_verifiable=True,
-    supports_signing=True,
-    import_note=(
-        "Phantom expects base58 of the 64-byte secret key (seed || public key), which "
-        "is what it exports itself. Base58 of the bare 32-byte seed is undocumented and "
-        "should not be relied on."
-    ),
-    aliases=("sol",),
-)
+SPEC = SolanaChain(id="solana", label="Solana", curves=(CURVE_ED25519,))

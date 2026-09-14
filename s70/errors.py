@@ -25,32 +25,17 @@ class DecryptionError(S70Error):
     """A share failed to decrypt."""
 
 
-class IntegrityError(S70Error):
-    """A share decrypted but failed its integrity check."""
-
-
 class KeyMaterialError(S70Error):
     """Decrypted plaintext was not in a recognised private-key format."""
 
 
-class ChainDetectionError(S70Error):
-    """The chain behind an address could not be determined."""
+class KmsParametersError(S70Error):
+    """AWS KMS import parameters are missing, malformed, or ambiguous."""
 
 
-class UnsupportedChainError(S70Error):
-    """The chain was identified but this tool does not handle it."""
+class KmsKeySpecError(S70Error):
+    """The requested KMS key spec contradicts the recovered key's curve."""
 
 
-class MissingDependencyError(S70Error):
-    """An optional phase-2 SDK is not installed."""
-
-    def __init__(self, package: str, purpose: str) -> None:
-        super().__init__(
-            f"{purpose} needs the '{package}' package, which is not installed.\n"
-            f"Install the transaction extras:  pip install -r requirements-tx.txt"
-        )
-        self.package = package
-
-
-class JobFileError(S70Error):
-    """A phase-2 job file is missing, malformed, or stale."""
+class KmsWrapError(S70Error):
+    """The key material could not be wrapped for import into KMS."""

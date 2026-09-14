@@ -1,7 +1,7 @@
 """Rendering a recovered key in the exact form a browser extension accepts.
 
-This is the heart of phase 1. Four of the eight chains here sit on Ed25519,
-and every one of them wants a *different* string built from the same 32 bytes:
+Four of the eight chains here sit on Ed25519, and every one of them wants a
+*different* string built from the same 32 bytes:
 
 ======  ==========  ================================================
 chain   wallet      string
@@ -9,7 +9,7 @@ chain   wallet      string
 Solana  Phantom     base58(seed || public key)          -- 64 bytes
 Stellar Freighter   StrKey ``S...``                     -- 32 bytes
 Sui     Suiet       bech32 ``suiprivkey1...``           -- flag || 32
-Aptos   Pontem      ``0x`` + 64 hex                     -- 32 bytes
+Aptos   Petra       ``0x`` + 64 hex                     -- 32 bytes
 ======  ==========  ================================================
 
 So the format is keyed off the target wallet, never off the curve.
@@ -17,7 +17,8 @@ So the format is keyed off the target wallet, never off the curve.
 Two chains genuinely cannot take a raw key and the guide says so rather than
 offering a string that will be rejected: Polkadot (Talisman needs a keystore
 file) and XRPL (extensions import a 16-byte family seed, which cannot be
-derived back from the private key this backup holds).
+derived back from the private key this backup holds). For XRPL the route is
+``s70 kms-export`` -- see :mod:`s70.kms`.
 """
 
 from __future__ import annotations
@@ -46,7 +47,6 @@ class ImportFormat:
     label: str
     value: str
     primary: bool = True
-    sensitive: bool = True
     note: str = ""
 
     def __repr__(self) -> str:  # keep key material out of tracebacks and logs
@@ -245,9 +245,10 @@ def _polkadot(key: KeyMaterial) -> ImportGuide:
         chain_label="Polkadot",
         wallet="Talisman",
         ui_path=[
-            "Press k here to write the keystore file",
+            "Press k here to write the keystore file, choosing a password",
             "Talisman -> Add account -> Import -> Import from Polkadot.js",
-            "Select the file this tool wrote (no password: it is unencrypted)",
+            "Select the file this tool wrote, then enter that same password",
+            "Delete the keystore file once the import has worked",
         ],
         formats=[
             ImportFormat(
@@ -272,20 +273,20 @@ def _xrpl(key: KeyMaterial) -> ImportGuide:
     No browser extension imports a raw XRPL private key -- Gem Wallet, Xaman
     and Crossmark all want a 16-byte family seed, and the seed-to-key
     derivation is one-way, so it cannot be worked backwards. The route off
-    these accounts is the offline signing flow, not an extension.
+    these accounts is AWS KMS, which imports both curves XRPL uses.
     """
     scalar = key.scalar.reveal()
     return ImportGuide(
         chain_id="xrpl",
         chain_label="XRPL",
-        wallet="(offline signing only)",
+        wallet="(no extension import; use AWS KMS)",
         formats=[
             ImportFormat(
                 label="Private key (hex)",
                 value=scalar.hex(),
                 note=(
-                    "Accepted by xrpl-py's low-level signing, which takes a private key "
-                    "directly. Not importable into any wallet extension."
+                    "Accepted by tooling that signs with a raw private key. Not "
+                    "importable into any wallet extension."
                 ),
             ),
             ImportFormat(
@@ -298,8 +299,9 @@ def _xrpl(key: KeyMaterial) -> ImportGuide:
             "No XRPL wallet extension can import this key. Gem Wallet, Xaman/Xumm and "
             "Crossmark all import a 16-byte family seed (or the mnemonic that encodes "
             "it), and this backup holds the derived private key -- the derivation is "
-            "one-way. Use the offline signing flow instead: `s70 inspect` then "
-            "`s70 sign` build and sign an AccountDelete that sweeps the whole balance."
+            "one-way. Export the key to AWS KMS instead (`s70 kms-prepare` then "
+            "`s70 kms-export`) and sign XRPL transactions with the KMS key. XRPL uses "
+            "secp256k1 and Ed25519, and KMS imports both."
         ),
     )
 
@@ -381,11 +383,16 @@ def raw_guide(key: KeyMaterial, chain_label: str = "unrecognised chain") -> Impo
         wallet="(no known extension)",
         formats=formats,
         warnings=[
-            f"This tool cannot derive a {chain_label} address, so the key below was "
-            "NOT cross-checked against the address in the backup. Its integrity rests "
-            "on the SHA-256 check alone.",
             "Confirm the address in your wallet after importing, before moving anything.",
         ],
+        blocked=(
+            f"This tool has no wallet-specific guidance for {chain_label}, and cannot "
+            f"derive a {chain_label} address, so the key below was NOT cross-checked "
+            "against the address in the backup -- its integrity rests on the SHA-256 "
+            "checksum alone. The key itself is complete and correct. Import it with "
+            f"whatever tooling {chain_label} provides, using one of the raw encodings "
+            "below."
+        ),
     )
 
 
@@ -400,7 +407,24 @@ _UNVERIFIED_CAVEATS = {
         "The address did not match. The account is probably sr25519, which this tool "
         "cannot rebuild -- a keystore written from it would import a different address."
     ),
+    "canton": (
+        "The address did not match. This tool's Canton fingerprint derivation is "
+        "reconstructed from a single observed account, so a mismatch may mean your "
+        "party uses a scheme it does not know rather than that the key is wrong. "
+        "Confirm the party id with your Canton node operator before concluding "
+        "anything."
+    ),
 }
+
+
+#: Shown on every key that was not proved against its recorded address,
+#: whatever the reason. The per-chain caveats above explain *why*; this says
+#: what to do about it, and it is the same advice in all cases.
+_UNPROVED_NOTE = (
+    "This key was NOT proved to control the address recorded beside it. The key "
+    "itself is intact -- the SHA-256 checksum passed -- but confirm the address in "
+    "your wallet before moving anything."
+)
 
 
 def guide_for(
@@ -408,17 +432,23 @@ def guide_for(
     key: KeyMaterial,
     chain_label: str = "",
     *,
-    address_verified: bool = True,
+    address_proved: bool = True,
 ) -> ImportGuide:
     """Build the import guide for one recovered key.
 
     ``chain`` may be ``None`` -- an unsupported or unidentified chain still
     yields the raw key bytes rather than nothing.
+
+    ``address_proved`` is :attr:`s70.session.WalletRecord.address_proved`: True
+    only when the key re-derived the recorded address. Anything less adds
+    :data:`_UNPROVED_NOTE`, plus the chain's own explanation where there is one.
     """
     builder = _BUILDERS.get(chain.id) if chain is not None else None
     if builder is None:
         return raw_guide(key, chain_label or (chain.label if chain else "unrecognised chain"))
     guide = builder(key)
-    if not address_verified and chain.id in _UNVERIFIED_CAVEATS:
-        guide.warnings.append(_UNVERIFIED_CAVEATS[chain.id])
+    if not address_proved:
+        guide.warnings.append(_UNPROVED_NOTE)
+        if chain.id in _UNVERIFIED_CAVEATS:
+            guide.warnings.append(_UNVERIFIED_CAVEATS[chain.id])
     return guide

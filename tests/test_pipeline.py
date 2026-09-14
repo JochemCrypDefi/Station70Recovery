@@ -22,7 +22,7 @@ import pytest
 from s70 import backup as backup_mod
 from s70 import chains, wallets
 from s70.chains import Status
-from s70.errors import BackupFormatError, KeyMaterialError
+from s70.errors import BackupFormatError, KeyMaterialError, S70Error
 from s70.keymaterial import (
     CURVE_ED25519,
     CURVE_SECP256K1,
@@ -74,8 +74,7 @@ def test_recovers_and_verifies_every_supported_wallet(session, synthetic):
 
     for meta, record in zip(wallets_meta, session.records, strict=True):
         # Unsupported chains are recovered too -- they just carry no verdict
-        # from an address check. Nothing is skipped any more.
-        assert record.skipped_reason is None
+        # from an address check. Nothing is withheld.
         assert record.error is None, record.error
         assert record.verdict is meta.expected_status, (
             f"{meta.name}: expected {meta.expected_status}, got {record.verdict}"
@@ -85,8 +84,6 @@ def test_recovers_and_verifies_every_supported_wallet(session, synthetic):
 def test_integrity_check_passes_for_all(session):
     session.recover_all()
     for record in session.records:
-        if record.skipped_reason:
-            continue
         assert record.integrity_result is True
 
 
@@ -99,10 +96,27 @@ def test_tampered_address_is_reported_as_mismatch(session):
     assert not tampered[0].fully_verified
 
 
-def test_canton_is_unverifiable_not_verified(session):
+def test_canton_party_id_is_reproduced_from_the_key(session):
+    """Canton fingerprints are derivable, so a Canton key is provable."""
     session.recover_all()
-    canton = [r for r in session.records if r.name == "Canton Party"]
-    assert canton[0].verdict is Status.UNVERIFIABLE
+    canton = [r for r in session.records if r.name == "Canton Party"][0]
+    assert canton.verdict is Status.VERIFIED
+    assert canton.address_proved
+
+
+def test_canton_that_does_not_match_is_a_mismatch_not_a_shrug(session):
+    """The check ran and failed. That must not read as "could not check"."""
+    session.recover_all()
+    foreign = [r for r in session.records if r.name == "Canton Foreign Scheme"][0]
+    assert foreign.verdict is Status.MISMATCH
+    assert not foreign.address_proved
+    # And the caveat has to reach the user, not be suppressed by a flag that
+    # counts "unprovable" as "fine".
+    guide = wallets.guide_for(
+        foreign.chain, foreign.key, foreign.chain_label, address_proved=False
+    )
+    assert any("NOT proved" in w for w in guide.warnings)
+    assert any("Canton" in w for w in guide.warnings)
 
 
 def test_unsupported_chain_still_yields_its_key(session):
@@ -110,7 +124,6 @@ def test_unsupported_chain_still_yields_its_key(session):
     session.recover_all()
     radix = [r for r in session.records if r.name == "Radix Main"][0]
 
-    assert radix.skipped_reason is None
     assert radix.decrypted is not None
     assert radix.integrity_result is True
     assert not radix.supported
@@ -119,7 +132,7 @@ def test_unsupported_chain_still_yields_its_key(session):
     assert radix.key is not None
     assert len(radix.key.scalar.reveal()) == 32
     assert radix.verdict is Status.UNSUPPORTED
-    assert not radix.verified_for_signing
+    assert not radix.address_proved
 
 
 def test_unsupported_chain_renders_raw_key_formats(session):
@@ -136,11 +149,19 @@ def test_unsupported_chain_renders_raw_key_formats(session):
     # must say plainly that the address was never checked.
     assert all(scalar.hex() in v or base64.b64encode(scalar).decode("ascii") in v
                for v in values)
-    assert any("not" in w.lower() and "cross-check" in w.lower() for w in guide.warnings)
+    # The user must be told the address was never checked, wherever it is shown.
+    shown = (guide.blocked or "") + " ".join(guide.warnings)
+    assert "cross-check" in shown.lower()
+    assert "not" in shown.lower()
+    assert "confirm the address" in shown.lower()
 
 
-def test_wrong_recovery_key_fails_cleanly(tmp_path):
-    """A different RSA key must fail, not return plausible garbage."""
+def test_wrong_recovery_key_is_caught_before_any_decryption(tmp_path):
+    """Say it once, up front -- not 34 opaque padding errors in a row.
+
+    The shares record the public key they were encrypted to, so a mismatched
+    recovery key is knowable without attempting a single decryption.
+    """
     good, _ = generate_backup(tmp_path / "a.json", rsa_bits=RSA_BITS)
     other, _ = generate_backup(tmp_path / "b.json", rsa_bits=RSA_BITS)
 
@@ -149,13 +170,32 @@ def test_wrong_recovery_key_fails_cleanly(tmp_path):
     swapped = tmp_path / "swapped.json"
     swapped.write_text(json.dumps(document))
 
+    with pytest.raises(S70Error, match="not the key its wallets were encrypted to"):
+        RecoverySession.open(backup_mod.load(swapped))
+
+
+def test_wrong_recovery_key_still_fails_cleanly_without_the_hint(tmp_path):
+    """Older backups may not record the wrapping key. Then it must fail per share.
+
+    A different RSA key must produce an error, never plausible garbage.
+    """
+    good, _ = generate_backup(tmp_path / "c.json", rsa_bits=RSA_BITS)
+    other, _ = generate_backup(tmp_path / "d.json", rsa_bits=RSA_BITS)
+
+    document = json.loads(good.read_text())
+    document["recovery_key"] = json.loads(other.read_text())["recovery_key"]
+    for entry in document["keys"]:
+        for share in entry["shares"]:
+            share["encryption"].pop("public_key")
+    swapped = tmp_path / "swapped-nohint.json"
+    swapped.write_text(json.dumps(document))
+
     session = RecoverySession.open(backup_mod.load(swapped))
     stats = session.recover_all()
     assert stats.verified == 0
-    assert stats.failed > 0
+    assert stats.failed == len(session.records)
     for record in session.records:
-        if not record.skipped_reason:
-            assert record.error is not None
+        assert record.error is not None
 
 
 def test_forget_keeps_the_verdict_but_drops_the_key(session):
@@ -393,20 +433,71 @@ def test_import_format_repr_hides_the_value():
 # --------------------------------------------------------------------------
 
 
+#: scrypt at the real N=32768 costs ~32 MiB and a noticeable pause per call.
+#: polkadot-js hard-validates that N, so the value is pinned by
+#: test_polkadot_keystore_uses_the_parameters_polkadot_js_demands and every
+#: other test here passes a cheap one.
+CHEAP_SCRYPT_N = 1 << 10
+
+
+def _decrypt_keystore(document, password: str) -> bytes:
+    """Decrypt an `encoded` blob the way polkadot-js does, for assertions."""
+    import hashlib as _hashlib
+
+    import nacl.secret
+
+    from s70 import keystore_polkadot
+
+    blob = base64.b64decode(document["encoded"])
+    salt, blob = blob[:32], blob[32:]
+    n = int.from_bytes(blob[0:4], "little")
+    p = int.from_bytes(blob[4:8], "little")
+    r = int.from_bytes(blob[8:12], "little")
+    nonce, ciphertext = blob[12:36], blob[36:]
+
+    derived = _hashlib.scrypt(
+        password.encode("utf-8"),
+        salt=salt,
+        n=n,
+        r=r,
+        p=p,
+        dklen=nacl.secret.SecretBox.KEY_SIZE,
+        maxmem=64 * 1024 * 1024,
+    )
+    assert (p, r) == (keystore_polkadot.SCRYPT_P, keystore_polkadot.SCRYPT_R)
+    return nacl.secret.SecretBox(derived).decrypt(ciphertext, nonce)
+
+
 def test_polkadot_keystore_structure():
     from s70 import keystore_polkadot
 
     seed = hashlib.sha256(b"keystore").digest()
-    document = keystore_polkadot.build_keystore(seed, "Recovered")
+    document = keystore_polkadot.build_keystore(
+        seed, "pw", "Recovered", scrypt_n=CHEAP_SCRYPT_N
+    )
 
     assert document["encoding"]["content"] == ["pkcs8", "ed25519"]
-    # Written unencrypted so Talisman imports it without a passphrase.
-    assert document["encoding"]["type"] == ["none"]
+    # Encrypted: Talisman rejects polkadot-js's unencrypted ["none"] form.
+    assert document["encoding"]["type"] == ["scrypt", "xsalsa20-poly1305"]
     assert document["encoding"]["version"] == "3"
+    assert document["meta"]["name"] == "Recovered"
+
+    # salt(32) + N/p/r(12) + nonce(24) + MAC(16) + the framed plaintext.
+    encoded = base64.b64decode(document["encoded"])
+    assert len(encoded) == 32 + 12 + 24 + 16 + (16 + 64 + 5 + 32)
+
+
+def test_polkadot_keystore_uses_the_parameters_polkadot_js_demands():
+    """N=32768, p=1, r=8 exactly. polkadot-js refuses anything else."""
+    from s70 import keystore_polkadot
+
+    seed = hashlib.sha256(b"keystore-params").digest()
+    document = keystore_polkadot.build_keystore(seed, "pw", "Recovered")
 
     encoded = base64.b64decode(document["encoded"])
-    # header(16) + secretKey(64) + divider(5) + publicKey(32)
-    assert len(encoded) == 16 + 64 + 5 + 32
+    assert int.from_bytes(encoded[32:36], "little") == 32768
+    assert int.from_bytes(encoded[36:40], "little") == keystore_polkadot.SCRYPT_P == 1
+    assert int.from_bytes(encoded[40:44], "little") == keystore_polkadot.SCRYPT_R == 8
 
 
 def test_polkadot_keystore_holds_the_right_key():
@@ -415,9 +506,11 @@ def test_polkadot_keystore_holds_the_right_key():
 
     seed = hashlib.sha256(b"keystore-roundtrip").digest()
     public = ed25519_public_from_seed(seed)
-    document = keystore_polkadot.build_keystore(seed, "Recovered")
+    document = keystore_polkadot.build_keystore(
+        seed, "pw", "Recovered", scrypt_n=CHEAP_SCRYPT_N
+    )
 
-    plaintext = base64.b64decode(document["encoded"])
+    plaintext = _decrypt_keystore(document, "pw")
     header = keystore_polkadot.PKCS8_HEADER
     divider = keystore_polkadot.PKCS8_DIVIDER
 
@@ -430,22 +523,46 @@ def test_polkadot_keystore_holds_the_right_key():
     assert secret_key == seed + public
 
 
+def test_polkadot_keystore_is_useless_without_the_password():
+    from nacl.exceptions import CryptoError
+
+    from s70 import keystore_polkadot
+
+    seed = hashlib.sha256(b"keystore-wrong-pw").digest()
+    document = keystore_polkadot.build_keystore(
+        seed, "right", "Recovered", scrypt_n=CHEAP_SCRYPT_N
+    )
+    with pytest.raises(CryptoError):
+        _decrypt_keystore(document, "wrong")
+
+
 def test_polkadot_keystore_rejects_a_bad_seed_length():
     from s70 import keystore_polkadot
     from s70.errors import S70Error
 
     with pytest.raises(S70Error, match="32 bytes"):
-        keystore_polkadot.build_keystore(bytes(16), "x")
+        keystore_polkadot.build_keystore(bytes(16), "pw", "x")
+
+
+def test_polkadot_keystore_requires_a_password():
+    """Talisman will ask for one, so an empty password is a dead file."""
+    from s70 import keystore_polkadot
+    from s70.errors import S70Error
+
+    with pytest.raises(S70Error, match="password is required"):
+        keystore_polkadot.build_keystore(bytes(32), "", "x")
 
 
 def test_polkadot_keystore_is_owner_only(tmp_path):
-    """It is a plaintext private key: it must never touch disk world-readable."""
+    """It holds a private key: it must never touch disk world-readable."""
     import os
     import stat
 
     from s70 import keystore_polkadot
 
-    path = keystore_polkadot.write_keystore(tmp_path / "ks.json", bytes(32), "x")
+    path = keystore_polkadot.write_keystore(
+        tmp_path / "ks.json", bytes(32), "pw", "x", scrypt_n=CHEAP_SCRYPT_N
+    )
     assert stat.S_IMODE(os.stat(path).st_mode) == 0o600
 
 
@@ -456,93 +573,79 @@ def test_polkadot_keystore_refuses_to_overwrite(tmp_path):
     path = tmp_path / "ks.json"
     path.write_text("existing")
     with pytest.raises(S70Error, match="refusing to overwrite"):
-        keystore_polkadot.write_keystore(path, bytes(32), "x")
+        keystore_polkadot.write_keystore(
+            path, bytes(32), "pw", "x", scrypt_n=CHEAP_SCRYPT_N
+        )
+    assert path.read_text() == "existing"
+
 
 
 # --------------------------------------------------------------------------
-# phase 2 guards
+# how failures are reported
 # --------------------------------------------------------------------------
 
 
-def test_transfer_rejects_a_destination_on_the_wrong_chain():
-    from s70 import txn
-    from s70.errors import S70Error
-
-    with pytest.raises(S70Error, match="not a valid"):
-        txn.inspect("stellar", "GA" + "A" * 54, "0x" + "0" * 40)
-
-
-def test_transfer_refuses_unsupported_chains():
-    from s70 import txn
-    from s70.errors import UnsupportedChainError
-
-    for chain_id in ("evm", "polkadot", "canton"):
-        with pytest.raises(UnsupportedChainError):
-            txn.module_for(chain_id)
+def _corrupt_one_checksum(source, tmp_path, name="Treasury EVM"):
+    """Copy a backup with one wallet's recorded SHA-256 replaced by a wrong one."""
+    document = json.loads(source.read_text())
+    entry = next(k for k in document["keys"] if k["key_name"] == name)
+    entry["shares"][0]["encryption"]["original_sha256"] = base64.b64encode(
+        hashlib.sha256(b"not the plaintext").digest()
+    ).decode("ascii")
+    path = tmp_path / "corrupt.json"
+    path.write_text(json.dumps(document))
+    return path
 
 
-def test_sui_signing_digest_is_intent_prefixed():
-    """Sui signs blake2b(intent || bcs), not the bytes themselves."""
-    import hashlib as _hashlib
+def test_hash_mismatch_is_counted_separately_from_a_wrong_address(synthetic, tmp_path):
+    """Two different failures that call for two different actions.
 
-    from s70.txn import sui_tx
+    "Do not trust these bytes" and "these bytes open a different account" were
+    once the same number, under a label meaning only the second.
+    """
+    source, _ = synthetic
+    session = RecoverySession.open(backup_mod.load(_corrupt_one_checksum(source, tmp_path)))
+    stats = session.recover_all()
 
-    payload = b"\x01\x02\x03"
-    expected = _hashlib.blake2b(
-        bytes([0, 0, 0]) + payload, digest_size=32
-    ).digest()
-    assert sui_tx.sui_signing_digest(payload) == expected
-    assert sui_tx.sui_signing_digest(payload) != _hashlib.blake2b(
-        payload, digest_size=32
-    ).digest()
-
-
-def test_sui_serialized_signature_layout():
-    from s70.errors import S70Error
-    from s70.txn import sui_tx
-
-    signature = bytes(64)
-    public = bytes(range(32))
-    serialized = base64.b64decode(sui_tx.serialize_signature(signature, public, 0x00))
-    assert len(serialized) == 1 + 64 + 32
-    assert serialized[0] == 0x00
-    assert serialized[65:] == public
-
-    with pytest.raises(S70Error, match="64 bytes"):
-        sui_tx.serialize_signature(b"short", public, 0x00)
+    assert stats.hash_mismatch == 1
+    # The deliberately-wrong-address wallets are still counted as mismatches,
+    # and the corrupted one is not lumped in with them.
+    assert stats.mismatched >= 1
+    corrupted = [r for r in session.records if r.integrity_result is False]
+    assert [r.name for r in corrupted] == ["Treasury EVM"]
 
 
-def test_job_file_round_trip(tmp_path):
-    from s70.txn.job import Asset, Precondition, TransferJob
+def test_verify_explains_the_check_that_failed(synthetic, tmp_path, capsys):
+    """A red HASH MISMATCH must not be annotated with the address check passing."""
+    from s70 import cli
 
-    job = TransferJob(
-        chain="stellar",
-        source_address="G" + "A" * 55,
-        destination_address="G" + "B" * 55,
-        network={"sequence": "1"},
-        assets=[Asset(symbol="XLM", amount="1.5", identifier="native")],
-        preconditions=[Precondition("exists", True, "fine")],
-    )
-    path = job.write(tmp_path / "job.json")
-    reloaded = TransferJob.read(path)
+    source, _ = synthetic
+    path = _corrupt_one_checksum(source, tmp_path)
+    assert cli.main(["verify", str(path)]) == 1
 
-    assert reloaded.chain == job.chain
-    assert reloaded.assets[0].symbol == "XLM"
-    assert reloaded.preconditions[0].satisfied is True
-    assert reloaded.ready
+    err = capsys.readouterr().err
+    assert "does not match the SHA-256 checksum" in err
+    assert "address derived from the recovered key matches" not in err
 
 
-def test_job_with_blocking_precondition_is_not_ready():
-    from s70.txn.job import Precondition, TransferJob
+def test_verify_exits_non_zero_on_a_bad_checksum(synthetic, tmp_path):
+    from s70 import cli
 
-    job = TransferJob(
-        chain="xrpl",
-        source_address="r1",
-        destination_address="r2",
-        preconditions=[
-            Precondition("too soon", False, "wait 256 ledgers", blocking=True),
-            Precondition("cosmetic", False, "whatever", blocking=False),
-        ],
-    )
-    assert not job.ready
-    assert len(job.blocking_failures) == 1
+    source, _ = synthetic
+    assert cli.main(["verify", str(_corrupt_one_checksum(source, tmp_path))]) == 1
+
+
+def test_verify_exits_zero_on_a_clean_backup(synthetic, capsys):
+    """The synthetic set contains deliberate mismatches, so build a clean one."""
+    from s70 import cli
+
+    path, _ = synthetic
+    document = json.loads(path.read_text())
+    document["keys"] = [
+        k
+        for k in document["keys"]
+        if k["key_name"] in ("Treasury EVM", "Solana Main", "Canton Party")
+    ]
+    clean = path.parent / "clean.json"
+    clean.write_text(json.dumps(document))
+    assert cli.main(["verify", str(clean)]) == 0

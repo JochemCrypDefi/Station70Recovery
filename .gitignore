@@ -1,16 +1,19 @@
-# NEVER commit recovery material.
+# NEVER commit recovery material. `*.json` covers backups, keystores and the
+# KMS import parameters in one line -- there is nothing in this project that
+# needs to be a committed .json.
 *.json
-!package.json
-backup-*.json
 *.pem
 *.der
 *.key
-keystore-*.json
-job-*.json
-signed-*.json
-signed-*.txt
 out/
 wheels/
+
+# AWS KMS export. The wrapped blob is ciphertext and the import token is
+# public, but neither belongs in a repo, and *.der/*.bin would catch a
+# stray unwrapped key.
+*.bin
+Import_Parameters_*/
+import-parameters*.json
 
 # Python
 __pycache__/

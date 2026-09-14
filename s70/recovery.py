@@ -1,18 +1,13 @@
 """Recovery-key loading and share decryption.
 
-This is the part carried over from the original ``recover_wallets.py``: load
-the RSA recovery key, RSA-OAEP-decrypt each share, and check the plaintext
-against ``original_sha256``. The behaviour is unchanged; what is new is
+Load the RSA recovery key the backup carries, RSA-OAEP-decrypt each share, and
+check the plaintext against the ``original_sha256`` recorded beside it.
 
-* the recovery key may come from an external file instead of the backup,
-* an unrecognised or mislabelled ciphersuite is recovered from by trying the
-  plausible OAEP hash combinations rather than failing, and
-* results are returned as values instead of printed, so the TUI can drive it.
-
-Why trying hashes is safe: OAEP decoding is itself an integrity check. A
-wrong hash choice fails the padding check and raises, rather than returning
-plausible-but-wrong plaintext. ``original_sha256`` then confirms it
-independently.
+``ciphersuite`` names the OAEP hash, but it is treated as a hint: the
+plausible hash combinations are all tried, starting with the declared one. That
+is safe because OAEP decoding is itself an integrity check -- a wrong hash
+fails the padding check and raises, so it cannot return plausible-but-wrong
+plaintext. ``original_sha256`` then confirms the result independently.
 """
 
 from __future__ import annotations
@@ -78,12 +73,22 @@ class DecryptedShare:
     scheme_mismatch: bool
 
     @property
-    def integrity_label(self) -> str:
-        if self.integrity_verified is True:
-            return "verified (sha256 matches)"
-        if self.integrity_verified is None:
-            return "no hash in backup"
-        return "HASH MISMATCH"
+    def scheme_warning(self) -> str:
+        """Said out loud when the file's declared ciphersuite was wrong.
+
+        Trying several OAEP digests is safe -- padding is self-validating -- but
+        a file whose ``ciphersuite`` does not describe its own ciphertext is a
+        file that has been through something, and that is worth one line rather
+        than being noticed and dropped.
+        """
+        if not self.scheme_mismatch:
+            return ""
+        return (
+            f"the backup declares its ciphersuite but decryption only succeeded with "
+            f"{self.scheme_used}. The key is intact -- OAEP padding is self-validating, "
+            "so a wrong digest cannot return wrong bytes -- but the file's own label is "
+            "inaccurate."
+        )
 
 
 # --------------------------------------------------------------------------
@@ -133,6 +138,20 @@ def load_recovery_key_from_b64(value: str) -> rsa.RSAPrivateKey:
 
 def describe_recovery_key(key: rsa.RSAPrivateKey) -> str:
     return f"RSA-{key.key_size}"
+
+
+def public_key_b64(key: rsa.RSAPrivateKey) -> str:
+    """The public half as base64 DER SubjectPublicKeyInfo.
+
+    Exactly the form the backup records in ``encryption.public_key``, so the
+    two can be compared as strings.
+    """
+    return base64.b64encode(
+        key.public_key().public_bytes(
+            serialization.Encoding.DER,
+            serialization.PublicFormat.SubjectPublicKeyInfo,
+        )
+    ).decode("ascii")
 
 
 # --------------------------------------------------------------------------

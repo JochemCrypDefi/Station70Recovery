@@ -89,16 +89,5 @@ class AptosChain(ChainSpec):
 
 
 SPEC = AptosChain(
-    id="aptos",
-    label="Aptos",
-    curves=(CURVE_ED25519, CURVE_SECP256K1),
-    wallet="Petra",
-    address_verifiable=True,
-    supports_signing=True,
-    import_note=(
-        "Petra accepts a plain '0x' + 64 hex private key. The AIP-80 prefixed form "
-        "('ed25519-priv-0x...') is the standardised Aptos encoding and is offered as "
-        "a fallback."
-    ),
-    aliases=("apt",),
+    id="aptos", label="Aptos", curves=(CURVE_ED25519, CURVE_SECP256K1)
 )

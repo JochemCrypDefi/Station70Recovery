@@ -137,15 +137,21 @@ def write_keystore(
     name: str,
     *,
     ss58_prefix: int = ss58.PREFIX_POLKADOT,
+    scrypt_n: int = SCRYPT_N,
 ) -> Path:
     """Write the keystore with owner-only permissions.
 
     ``O_CREAT | O_EXCL`` with mode ``0600`` in a single call: the file never
     exists at umask permissions, and an existing file (or a symlink planted at
     the path) is refused rather than followed.
+
+    ``scrypt_n`` is here only so tests need not pay 32 MiB of scrypt per case.
+    Leave it alone: polkadot-js rejects a keystore whose N is not 32768.
     """
     path = Path(path).expanduser()
-    document = build_keystore(seed, password, name, ss58_prefix=ss58_prefix)
+    document = build_keystore(
+        seed, password, name, ss58_prefix=ss58_prefix, scrypt_n=scrypt_n
+    )
     path.parent.mkdir(parents=True, exist_ok=True)
 
     try:

@@ -39,15 +39,4 @@ class SuiChain(ChainSpec):
         return ["0x" + blake2b_256(payload).hex()]
 
 
-SPEC = SuiChain(
-    id="sui",
-    label="Sui",
-    curves=(CURVE_ED25519, CURVE_SECP256K1),
-    wallet="Suiet",
-    address_verifiable=True,
-    supports_signing=True,
-    import_note=(
-        "Sui replaced hex private keys with the bech32 'suiprivkey1...' form (SIP-15). "
-        "Hex import is deprecated and may already be rejected -- use the bech32 string."
-    ),
-)
+SPEC = SuiChain(id="sui", label="Sui", curves=(CURVE_ED25519, CURVE_SECP256K1))

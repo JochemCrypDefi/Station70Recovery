@@ -33,11 +33,7 @@ ALL: tuple[ChainSpec, ...] = (
     canton.SPEC,
 )
 
-_BY_ID: dict[str, ChainSpec] = {}
-for _spec in ALL:
-    _BY_ID[_spec.id] = _spec
-    for _alias in _spec.aliases:
-        _BY_ID[_alias] = _spec
+_BY_ID: dict[str, ChainSpec] = {spec.id: spec for spec in ALL}
 
 #: ``metadata.chain_id`` -> this tool's chain id. The backup writes
 #: ``ch-<SLIP-44 coin type>``; SLIP-44 is what makes ``ch-637`` (Aptos) and
@@ -85,9 +81,6 @@ class Status(str, Enum):
     VERIFIED = "verified"
     """The derived address matches the one in the backup."""
 
-    UNVERIFIABLE = "unverifiable"
-    """Chain identified, but its address cannot be recomputed offline."""
-
     MISMATCH = "mismatch"
     """Chain identified, but the key derives a different address."""
 
@@ -100,6 +93,23 @@ class Status(str, Enum):
     NO_ADDRESS = "no-address"
     """The backup recorded no address, so nothing can be cross-checked."""
 
+    @property
+    def label(self) -> str:
+        """How this status is written for a person.
+
+        Both front ends and the summary counters read this, so a status reads
+        the same everywhere it appears. ``UNSUPPORTED`` in particular says what
+        was actually established -- the checksum passed -- rather than naming
+        the thing the tool could not do.
+        """
+        return _STATUS_LABELS.get(self, self.value)
+
+
+_STATUS_LABELS: dict[Status, str] = {
+    Status.UNSUPPORTED: "sha-256 only",
+    Status.NO_ADDRESS: "no address",
+}
+
 
 @dataclass(frozen=True)
 class Identification:
@@ -110,22 +120,19 @@ class Identification:
     detail: str
 
     @property
-    def ok(self) -> bool:
-        """True when the address check passed, or could not be run at all.
+    def address_proved(self) -> bool:
+        """True only when the key re-derived the address recorded in the backup.
 
-        This gates *signing*, not display. Use :attr:`has_key` to decide
-        whether there are key bytes to show -- there usually are, even here.
+        This is the narrow question -- *was the check run, and did it pass?* --
+        and every caveat in the tool hangs off it. An outcome where the check
+        could not be run is False, not True: "nothing was proved" and "the
+        proof succeeded" must never collapse into one flag.
+
+        It says how much was proved about the key, not whether there is one to
+        show. :attr:`key` is populated on almost every outcome, including the
+        ones this returns False for.
         """
-        return self.status in (Status.VERIFIED, Status.UNVERIFIABLE)
-
-    @property
-    def has_key(self) -> bool:
-        """True when key material was recovered, whatever the verdict."""
-        return self.key is not None
-
-    @property
-    def chain_label(self) -> str:
-        return self.chain.label if self.chain else "unknown"
+        return self.status is Status.VERIFIED
 
 
 def by_id(identifier: str) -> ChainSpec | None:
@@ -156,6 +163,12 @@ def identify(
     the whole point of the tool; the status says how much has been proved
     about it, and callers must not treat a non-``VERIFIED`` status as a reason
     to withhold the bytes.
+
+    Only ``VERIFIED`` means the key was proved to control the recorded address.
+    Every other status means it was not -- either the check failed, or there
+    was nothing to check it against -- and callers read
+    :attr:`Identification.address_proved` rather than re-deciding that per
+    call site.
     """
     if not keys:
         return Identification(
@@ -181,12 +194,22 @@ def identify(
         specs = shape_candidates(address)
 
     if not address:
+        detail = (
+            "backup recorded no address for this share, so the key cannot be "
+            "cross-checked"
+        )
+        if len(keys) > 1:
+            detail += (
+                f". These bytes are a valid key on {' and '.join(k.curve for k in keys)}, "
+                f"and with no address and no key_type to settle it, {keys[0].curve} is "
+                "shown -- the two derive unrelated accounts, so confirm in your wallet"
+            )
         return Identification(
             Status.NO_ADDRESS,
             specs[0] if len(specs) == 1 else None,
             keys[0],
             None,
-            "backup recorded no address for this share, so the key cannot be cross-checked",
+            detail,
         )
 
     if not specs:
@@ -214,20 +237,8 @@ def identify(
                     f"{spec.label} address derived from the recovered key matches the backup",
                 )
 
-    # No match. Distinguish "can't check" from "checked and wrong".
-    unverifiable = [spec for spec in specs if not spec.address_verifiable]
-    if unverifiable:
-        spec = unverifiable[0]
-        key = next((k for k in keys if k.curve in spec.curves), keys[0])
-        return Identification(
-            Status.UNVERIFIABLE,
-            spec,
-            key,
-            None,
-            f"{spec.label} addresses cannot be recomputed offline; key integrity rests "
-            "on the SHA-256 check alone",
-        )
-
+    # No match: the check ran against every candidate chain and none of them
+    # reproduced the recorded address.
     if len(specs) == 1:
         spec = specs[0]
         key = next((k for k in keys if k.curve in spec.curves), keys[0])

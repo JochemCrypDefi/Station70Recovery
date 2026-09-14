@@ -14,14 +14,6 @@ The threat model is written out in ``docs/THREAT-MODEL.md``.
 from __future__ import annotations
 
 import ctypes
-from typing import Final
-
-#: Printed before anything sensitive is displayed.
-SCROLLBACK_WARNING: Final = (
-    "Private keys are shown on the alternate screen buffer, which is not added "
-    "to terminal scrollback and is cleared when this app exits. Do not "
-    "screenshot, stream, or screen-share this window."
-)
 
 
 class Secret:
@@ -92,8 +84,3 @@ def mask(text: str, keep: int = 6) -> str:
     if len(text) <= keep * 2 + 1:
         return text
     return f"{text[:keep]}…{text[-keep:]}"
-
-
-def redact(text: str) -> str:
-    """Fully redact a value, keeping only its length."""
-    return f"[{len(text)} chars hidden]"

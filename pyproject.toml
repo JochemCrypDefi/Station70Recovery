@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "s70-recovery"
 version = "1.0.0"
-description = "Offline TUI for recovering CrypDefi wallet backup keys and preparing asset-transfer transactions."
+description = "Offline tool for recovering wallet keys from a Station70 backup, displaying them in importable form, and exporting them to AWS KMS."
 readme = "README.md"
 requires-python = ">=3.10"
 license = { text = "Proprietary" }
@@ -13,28 +13,14 @@ license = { text = "Proprietary" }
 # Core dependencies. Deliberately small and pure-Python where possible so the
 # whole set can be vendored as wheels onto an air-gapped machine.
 dependencies = [
-    "cryptography>=42.0",   # RSA-OAEP, Ed25519, secp256k1, AES-GCM
+    "cryptography>=42.0",   # RSA-OAEP, Ed25519, secp256k1, AES key wrap (RFC 5649)
     "pycryptodome>=3.20",   # keccak256 + RIPEMD160 (both missing from hashlib)
     "pynacl>=1.5",          # xsalsa20-poly1305 for the Polkadot keystore
     "textual>=0.79",        # TUI
     "rich>=13.7",           # tables / panels (pulled in by textual anyway)
-    "segno>=1.6",           # ASCII QR for signed transaction blobs
 ]
 
 [project.optional-dependencies]
-# Phase-2 transaction building. Heavy, and the SDKs move fast -- installed
-# separately and imported lazily so the recovery core never depends on them.
-# Sui is absent on purpose: its signing scheme is implemented directly and
-# the `sui` CLI builds the transaction. See s70/txn/sui_tx.py.
-tx = [
-    "solders==0.29.0",
-    "solana==0.40.3",
-    "aptos-sdk==0.11.0",
-    "stellar-sdk==16.1.0",
-    "xrpl-py==5.1.0",
-    "eth-account>=0.13",
-]
-
 dev = ["pytest>=8.0"]
 
 [project.scripts]

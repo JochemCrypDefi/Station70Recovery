@@ -1,8 +1,11 @@
-"""Bech32 / Bech32m (BIP-173 / BIP-350).
+"""Bech32 (BIP-173), the encoding of a Sui private key.
 
-Sui private keys use plain **bech32** (constant 1), not bech32m. Encoding a
-Sui key with bech32m produces a string that starts with ``suiprivkey1`` and
-fails checksum validation inside the wallet, so the variant matters.
+Sui uses plain **bech32** (checksum constant 1), not bech32m. Encoding a Sui
+key with bech32m produces a string that still starts with ``suiprivkey1`` and
+then fails checksum validation inside the wallet, so the constant matters.
+Only bech32 is implemented here, which is one way to be sure of it.
+
+Encoding only: nothing in this tool reads a bech32 string back.
 
 Adapted from the BIP-173 reference implementation.
 """
@@ -12,7 +15,6 @@ from __future__ import annotations
 CHARSET = "qpzry9x8gf2tvdw0s3jn54khce6mua7l"
 
 BECH32_CONST = 1
-BECH32M_CONST = 0x2BC830A3
 
 
 def _polymod(values: list[int]) -> int:
@@ -53,44 +55,18 @@ def convertbits(data: bytes | list[int], frombits: int, tobits: int, pad: bool =
     return ret
 
 
-def _create_checksum(hrp: str, data: list[int], const: int) -> list[int]:
+def _create_checksum(hrp: str, data: list[int]) -> list[int]:
     values = _hrp_expand(hrp) + data
-    polymod = _polymod(values + [0, 0, 0, 0, 0, 0]) ^ const
+    polymod = _polymod(values + [0, 0, 0, 0, 0, 0]) ^ BECH32_CONST
     return [(polymod >> 5 * (5 - i)) & 31 for i in range(6)]
 
 
-def encode(hrp: str, data: list[int], *, bech32m: bool = False) -> str:
+def encode(hrp: str, data: list[int]) -> str:
     """Encode 5-bit ``data`` groups under human-readable prefix ``hrp``."""
-    const = BECH32M_CONST if bech32m else BECH32_CONST
-    combined = data + _create_checksum(hrp, data, const)
+    combined = data + _create_checksum(hrp, data)
     return hrp + "1" + "".join(CHARSET[d] for d in combined)
 
 
-def encode_bytes(hrp: str, payload: bytes, *, bech32m: bool = False) -> str:
+def encode_bytes(hrp: str, payload: bytes) -> str:
     """Convenience wrapper: 8-bit ``payload`` -> bech32 string."""
-    return encode(hrp, convertbits(payload, 8, 5), bech32m=bech32m)
-
-
-def decode(text: str, *, bech32m: bool = False) -> tuple[str, list[int]]:
-    """Decode and verify a bech32(m) string, returning (hrp, 5-bit data)."""
-    if text != text.lower() and text != text.upper():
-        raise ValueError("bech32 string is mixed case")
-    text = text.lower()
-    pos = text.rfind("1")
-    if pos < 1 or pos + 7 > len(text):
-        raise ValueError("bech32 string has no valid separator position")
-    hrp, data_part = text[:pos], text[pos + 1 :]
-    try:
-        data = [CHARSET.index(c) for c in data_part]
-    except ValueError:
-        raise ValueError("bech32 string contains an out-of-charset character") from None
-    const = BECH32M_CONST if bech32m else BECH32_CONST
-    if _polymod(_hrp_expand(hrp) + data) != const:
-        raise ValueError("bech32 checksum mismatch")
-    return hrp, data[:-6]
-
-
-def decode_bytes(text: str, *, bech32m: bool = False) -> tuple[str, bytes]:
-    """Decode a bech32(m) string back to (hrp, 8-bit payload)."""
-    hrp, data = decode(text, bech32m=bech32m)
-    return hrp, bytes(convertbits(data, 5, 8, pad=False))
+    return encode(hrp, convertbits(payload, 8, 5))

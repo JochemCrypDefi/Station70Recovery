@@ -4,18 +4,23 @@ Keeping this separate from both front ends means the decryption logic is
 exercised identically whether you run ``s70 list``, ``s70 verify`` or the
 TUI, and it keeps key material out of widget state.
 
-Decryption is lazy and per-wallet on purpose. The tool never decrypts every
-key in the backup because you wanted to look at one -- each reveal is an
-explicit, individually confirmed action.
+:meth:`RecoverySession.recover` decrypts one wallet and is idempotent;
+:meth:`recover_all` does the whole backup and takes ``forget_keys`` to drop
+each key as soon as its verdict is recorded, which is what a bulk check wants
+-- the answers, not every private key in the file held in memory at once.
 
 Every wallet is decryptable. Chains this tool cannot derive an address for are
 still recovered and still show their raw key bytes; what they lose is the
 address cross-check, which the UI reports rather than hides.
+
+:attr:`WalletRecord.address_proved` is the one place that answers "was this key
+proved to control the address printed beside it?". Every caveat, warning and
+refusal in the tool reads it instead of re-deriving the answer from a status.
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
 from cryptography.hazmat.primitives.asymmetric import rsa
 
@@ -41,7 +46,6 @@ class WalletRecord:
     decrypted: DecryptedShare | None = None
     identification: Identification | None = None
     error: str | None = None
-    skipped_reason: str | None = None
 
     # Verdicts, retained after forget() discards the key material above. They
     # are what the inventory table displays, so verifying everything does not
@@ -50,6 +54,8 @@ class WalletRecord:
     verdict: Status | None = None
     verdict_detail: str = ""
     verdict_chain_id: str | None = None
+    #: Set when the file's declared ciphersuite did not match what decrypted it.
+    scheme_warning: str = ""
 
     @property
     def address(self) -> str | None:
@@ -84,17 +90,24 @@ class WalletRecord:
 
         The private key is the deliverable. A failed or impossible address
         cross-check is information to show alongside it, not grounds for
-        withholding it -- see :attr:`verified_for_signing` for the stricter
-        test the transfer flow uses.
+        withholding it -- see :attr:`address_proved` for whether the
+        cross-check actually passed.
         """
         if self.identification:
             return self.identification.key
         return None
 
     @property
-    def verified_for_signing(self) -> bool:
-        """True only when the key provably controls the recorded address."""
-        return bool(self.identification and self.identification.ok)
+    def address_proved(self) -> bool:
+        """True only when this key re-derived the address recorded beside it.
+
+        The single authority on "how much was proved", read by the import
+        guide, the KMS export warning and the keystore writer alike. Anything
+        short of a passed check -- failed, ambiguous, no address recorded, no
+        derivation for the chain -- is False, so a caveat is never suppressed
+        by a check that never ran.
+        """
+        return bool(self.identification and self.identification.address_proved)
 
     @property
     def chain(self) -> ChainSpec | None:
@@ -130,31 +143,18 @@ class WalletRecord:
 
     @property
     def status_label(self) -> str:
-        if self.skipped_reason:
-            return "skipped"
         if self.error:
             return "error"
         if self.integrity_result is False:
             return "HASH MISMATCH"
         if self.verdict is None:
             return "not recovered"
-        return self.verdict.value
-
-    @property
-    def soft_verified(self) -> bool:
-        """The recorded SHA-256 of the plaintext matched.
-
-        Weaker than :attr:`fully_verified`: it proves the decryption returned
-        exactly the bytes that were encrypted, which catches a wrong recovery
-        key or a corrupt share. It does *not* prove the key controls the
-        address in the backup -- only re-deriving the address does that.
-        """
-        return self.integrity_result is True
+        return self.verdict.label
 
     @property
     def fully_verified(self) -> bool:
-        """Both integrity checks passed: SHA-256 and address derivation."""
-        return self.integrity_result is not False and self.verdict is Status.VERIFIED
+        """Both checks passed: the SHA-256 checksum and the address derivation."""
+        return self.integrity_result is not False and self.address_proved
 
     @property
     def integrity_label(self) -> str:
@@ -169,10 +169,17 @@ class WalletRecord:
 
 @dataclass
 class SessionStats:
-    total: int = 0
+    """Counts for the one-line summary. Every wallet lands in exactly one.
+
+    ``hash_mismatch`` is deliberately its own count and not folded into
+    ``mismatched``: a failed checksum means *do not trust these bytes*, while a
+    failed address check means *these bytes open a different account*. They
+    call for different actions, so they are never reported as the same number.
+    """
+
     verified: int = 0
-    unverifiable: int = 0
     mismatched: int = 0
+    hash_mismatch: int = 0
     failed: int = 0
     #: Decrypted and SHA-256-checked, but no address derivation exists for the
     #: chain, so the key was never proved to control the recorded address.
@@ -198,14 +205,34 @@ class RecoverySession:
 
     @classmethod
     def open(cls, backup: Backup) -> RecoverySession:
-        """Load the RSA recovery key that the backup file carries."""
+        """Load the RSA recovery key that the backup file carries, and check it.
+
+        The shares record the public key they were encrypted to, so whether the
+        embedded recovery key actually opens this file is knowable before a
+        single decryption is attempted. Answering it here costs nothing and
+        replaces one opaque padding failure per wallet with one sentence.
+        """
         if not backup.recovery_key_b64:
             raise S70Error(
                 f"{backup.path.name} has no 'recovery_key' field, so there is nothing "
-                "to decrypt the wallet keys with. Every CrypDefi backup embeds one -- "
-                "this file is truncated or is not a CrypDefi backup."
+                "to decrypt the wallet keys with. Every Station70 backup embeds one -- "
+                "this file is truncated or is not a Station70 backup."
             )
-        return cls(backup, recovery.load_recovery_key_from_b64(backup.recovery_key_b64))
+        key = recovery.load_recovery_key_from_b64(backup.recovery_key_b64)
+
+        declared = {
+            share.wrapping_public_key_b64
+            for _, share in backup.iter_shares()
+            if share.wrapping_public_key_b64
+        }
+        if declared and recovery.public_key_b64(key) not in declared:
+            raise S70Error(
+                f"the 'recovery_key' embedded in {backup.path.name} is not the key its "
+                "wallets were encrypted to, so none of them would decrypt. The file has "
+                "most likely been edited, or assembled from two different backups. "
+                "Use the original, unmodified file."
+            )
+        return cls(backup, key)
 
     @property
     def recovery_key_label(self) -> str:
@@ -219,7 +246,6 @@ class RecoverySession:
             return record
 
         record.error = None
-        record.skipped_reason = None
 
         try:
             decrypted = recovery.decrypt_share(self.recovery_key, record.share)
@@ -229,6 +255,7 @@ class RecoverySession:
 
         record.decrypted = decrypted
         record.integrity_result = decrypted.integrity_verified
+        record.scheme_warning = decrypted.scheme_warning
 
         try:
             candidates = parse_candidates(decrypted.plaintext.reveal())
@@ -255,20 +282,18 @@ class RecoverySession:
         wallet's verdict is recorded, which is what a bulk verification wants:
         the answer, not 23 private keys sitting in memory.
         """
-        stats = SessionStats(total=len(self.records))
+        stats = SessionStats()
         for record in self.records:
             self.recover(record)
 
             if record.error:
                 stats.failed += 1
             elif record.integrity_result is False:
-                stats.mismatched += 1
+                stats.hash_mismatch += 1
             elif record.verdict is None:
                 stats.failed += 1
             elif record.verdict is Status.VERIFIED:
                 stats.verified += 1
-            elif record.verdict is Status.UNVERIFIABLE:
-                stats.unverifiable += 1
             elif record.verdict in (Status.UNSUPPORTED, Status.NO_ADDRESS):
                 stats.sha_only += 1
             else:
@@ -279,9 +304,6 @@ class RecoverySession:
         return stats
 
     # -- inventory --------------------------------------------------------
-
-    def inventory(self) -> list[WalletRecord]:
-        return self.records
 
     def unsupported(self) -> list[WalletRecord]:
         return [record for record in self.records if not record.supported]
@@ -294,18 +316,9 @@ class RecoverySession:
         closing it. It still means a long-running TUI session is not sitting
         on every key you have ever looked at.
 
-        ``integrity_result``, ``verdict`` and ``verdict_chain_id`` survive, so
-        the inventory keeps showing what was established without holding the
-        key that established it.
+        ``integrity_result``, ``verdict``, ``verdict_chain_id`` and
+        ``scheme_warning`` survive, so the inventory keeps showing what was
+        established without holding the key that established it.
         """
         record.decrypted = None
         record.identification = None
-
-
-@dataclass
-class RevealResult:
-    """A recovered key rendered for one target wallet."""
-
-    record: WalletRecord
-    guide: object  # s70.wallets.ImportGuide -- imported lazily to avoid a cycle
-    notes: list[str] = field(default_factory=list)

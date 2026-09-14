@@ -1,13 +1,11 @@
 """The chain abstraction.
 
-A :class:`ChainSpec` answers three questions:
+A :class:`ChainSpec` answers two questions:
 
 1. *Could this address belong to me?* -- a cheap shape test used to narrow
    candidates before anything is decrypted.
 2. *What addresses would this key produce under my rules?* -- used after
    decryption to confirm the chain and prove the key is the right one.
-3. *How should a human move funds off this chain?* -- capability flags that
-   drive what the UI offers.
 
 Question 2 is the important one. Several chains share an address shape
 (Aptos and Sui are both ``0x`` + 64 hex; Solana and Polkadot are both
@@ -19,7 +17,7 @@ correct rather than merely well-formed.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
 from s70.keymaterial import KeyMaterial
 
@@ -32,18 +30,6 @@ class ChainSpec:
     label: str
     #: Curves this chain's keys can use, in order of likelihood.
     curves: tuple[str, ...]
-    #: Browser extension we document an import path for.
-    wallet: str
-    #: False when the address cannot be recomputed offline from the public key,
-    #: so a mismatch is inconclusive rather than a failure.
-    address_verifiable: bool = True
-    #: True when phase 2 can build and sign a transfer for this chain.
-    supports_signing: bool = False
-    #: Shown in the UI when signing is unavailable, explaining why.
-    signing_note: str = ""
-    #: Short note about the import path's limitations, if any.
-    import_note: str = ""
-    aliases: tuple[str, ...] = field(default=())
 
     # -- shape ------------------------------------------------------------
 

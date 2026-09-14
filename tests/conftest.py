@@ -37,6 +37,25 @@ from s70.session import RecoverySession
 RSA_BITS = 2048
 
 
+#: This tool's chain id -> the ``ch-<SLIP-44>`` a real backup writes. Kept here
+#: rather than imported from s70.chains so the fixtures pin the mapping instead
+#: of agreeing with whatever the code currently believes.
+CHAIN_IDS = {
+    "evm": "ch-60",
+    "xrpl": "ch-144",
+    "stellar": "ch-148",
+    "polkadot": "ch-354",
+    "solana": "ch-501",
+    "aptos": "ch-637",
+    "sui": "ch-784",
+    "canton": "ch-6767",
+    "radix": "ch-1022",
+}
+
+#: ``key_type`` as the backup spells it, per curve.
+KEY_TYPES = {"ed25519": "EDDSA_ED25519", "secp256k1": "ECDSA_SECP256k1"}
+
+
 @dataclass
 class SyntheticWallet:
     name: str
@@ -46,6 +65,10 @@ class SyntheticWallet:
     expected_status: Status
     #: How the plaintext is encoded, so a failure says which path broke.
     encoding: str
+    #: Curve key for KEY_TYPES, or "" to omit key_type from the file.
+    curve: str = ""
+    #: False to omit metadata.chain_id, exercising shape-only detection.
+    declare_chain_id: bool = True
 
 
 def _pkcs8_ed25519(seed: bytes) -> bytes:
@@ -58,17 +81,13 @@ def valid_secp256k1_scalar(source: bytes) -> bytes:
     return value.to_bytes(32, "big")
 
 
-# Kept under the old private name too: the wallet builders below call it.
-_valid_secp256k1_scalar = valid_secp256k1_scalar
-
-
 def build_synthetic_wallets() -> list[SyntheticWallet]:
     """One wallet per chain, deliberately covering every awkward path."""
     seeds = [hashlib.sha256(f"s70-test-{i}".encode()).digest() for i in range(12)]
     out: list[SyntheticWallet] = []
 
     # EVM -- secp256k1, raw 32-byte plaintext.
-    evm_scalar = _valid_secp256k1_scalar(seeds[0])
+    evm_scalar = valid_secp256k1_scalar(seeds[0])
     evm_public = secp256k1_public_from_scalar(evm_scalar)
     from s70.chains.evm import to_checksum_address
     from s70.codecs.hashes import keccak256
@@ -81,6 +100,7 @@ def build_synthetic_wallets() -> list[SyntheticWallet]:
             to_checksum_address(keccak256(evm_public)[-20:]),
             Status.VERIFIED,
             "raw 32-byte scalar",
+            curve="secp256k1",
         )
     )
 
@@ -95,6 +115,7 @@ def build_synthetic_wallets() -> list[SyntheticWallet]:
             b58.encode(sol_public),
             Status.VERIFIED,
             "Ed25519 seed||public (64 bytes)",
+            curve="ed25519",
         )
     )
 
@@ -111,6 +132,7 @@ def build_synthetic_wallets() -> list[SyntheticWallet]:
             "0x" + sha3_256(apt_public + b"\x00").hex(),
             Status.VERIFIED,
             "PKCS#8 Ed25519 (48 bytes)",
+            curve="ed25519",
         )
     )
 
@@ -128,6 +150,10 @@ def build_synthetic_wallets() -> list[SyntheticWallet]:
             "0x" + blake2b_256(b"\x00" + sui_public).hex(),
             Status.VERIFIED,
             "raw 32-byte scalar",
+            curve="ed25519",
+            # No chain_id: Aptos and Sui share an address shape, so this one
+            # can only be resolved by deriving both and comparing.
+            declare_chain_id=False,
         )
     )
 
@@ -141,6 +167,7 @@ def build_synthetic_wallets() -> list[SyntheticWallet]:
             strkey.encode_ed25519_public_key(ed25519_public_from_seed(xlm_seed)),
             Status.VERIFIED,
             "raw 32-byte scalar",
+            curve="ed25519",
         )
     )
 
@@ -155,11 +182,12 @@ def build_synthetic_wallets() -> list[SyntheticWallet]:
             ss58.encode(ed25519_public_from_seed(dot_seed), ss58.PREFIX_POLKADOT),
             Status.VERIFIED,
             "raw 32-byte scalar",
+            curve="ed25519",
         )
     )
 
     # XRPL -- secp256k1 derived key, raw 32 bytes.
-    xrp_scalar = _valid_secp256k1_scalar(seeds[6])
+    xrp_scalar = valid_secp256k1_scalar(seeds[6])
     from s70.chains.xrpl import account_id_to_address
     from s70.codecs.hashes import hash160
     from s70.keymaterial import compress_secp256k1
@@ -173,6 +201,7 @@ def build_synthetic_wallets() -> list[SyntheticWallet]:
             account_id_to_address(hash160(compress_secp256k1(xrp_public))),
             Status.VERIFIED,
             "raw 32-byte scalar",
+            curve="secp256k1",
         )
     )
 
@@ -186,20 +215,44 @@ def build_synthetic_wallets() -> list[SyntheticWallet]:
             None,
             Status.NO_ADDRESS,
             "raw 32-byte Ed25519 seed",
+            # No key_type either: nothing settles the curve, so both readings
+            # are offered and the UI has to say which one it picked.
+            curve="",
         )
     )
 
-    # Canton -- deliberately given a fingerprint we cannot reproduce, so the
-    # test asserts the UNVERIFIABLE path rather than a fake success.
+    # Canton -- a party id built the way the tool believes Canton builds them.
+    # The hash purpose is spelled out here rather than imported, so that
+    # changing the constant in s70 breaks this test instead of moving with it.
     canton_seed = seeds[8]
+    canton_public = ed25519_public_from_seed(canton_seed)
+    canton_fingerprint = "1220" + hashlib.sha256(
+        (12).to_bytes(4, "big") + canton_public
+    ).hexdigest()
     out.append(
         SyntheticWallet(
             "Canton Party",
             "canton",
             canton_seed,
-            "testparty::1220" + hashlib.sha256(b"not-our-scheme").hexdigest(),
-            Status.UNVERIFIABLE,
+            f"testparty::{canton_fingerprint}",
+            Status.VERIFIED,
             "raw 32-byte scalar",
+            curve="ed25519",
+        )
+    )
+
+    # A Canton party id the tool cannot reproduce. Canton is verifiable, so
+    # this is a MISMATCH -- a check that ran and failed -- and must never be
+    # reported as a check that could not be run.
+    out.append(
+        SyntheticWallet(
+            "Canton Foreign Scheme",
+            "canton",
+            seeds[8],
+            "otherparty::1220" + hashlib.sha256(b"not-our-scheme").hexdigest(),
+            Status.MISMATCH,
+            "raw 32-byte scalar",
+            curve="ed25519",
         )
     )
 
@@ -208,11 +261,27 @@ def build_synthetic_wallets() -> list[SyntheticWallet]:
     out.append(
         SyntheticWallet(
             "Radix Main",
-            "unsupported",
+            "radix",
             seeds[9],
             "account_rdx12" + "8" * 53,
             Status.UNSUPPORTED,
             "raw 32-byte scalar",
+            curve="ed25519",
+        )
+    )
+
+    # A Substrate account whose Ed25519 reading does not reproduce the recorded
+    # address -- in the field this means sr25519. The tool must refuse to write
+    # a keystore from it, because the file would import a different account.
+    out.append(
+        SyntheticWallet(
+            "Polkadot Sr25519",
+            "polkadot",
+            seeds[5],
+            ss58.encode(ed25519_public_from_seed(seeds[11]), ss58.PREFIX_POLKADOT),
+            Status.MISMATCH,
+            "raw 32-byte scalar",
+            curve="ed25519",
         )
     )
 
@@ -227,6 +296,7 @@ def build_synthetic_wallets() -> list[SyntheticWallet]:
             strkey.encode_ed25519_public_key(ed25519_public_from_seed(seeds[11])),
             Status.MISMATCH,
             "raw 32-byte scalar",
+            curve="ed25519",
         )
     )
 
@@ -251,6 +321,13 @@ def generate_backup(
         label=None,
     )
 
+    recovery_spki_b64 = base64.b64encode(
+        public_key.public_bytes(
+            serialization.Encoding.DER,
+            serialization.PublicFormat.SubjectPublicKeyInfo,
+        )
+    ).decode("ascii")
+
     synthetic = build_synthetic_wallets()
     keys: list[dict[str, Any]] = []
     for wallet in synthetic:
@@ -258,23 +335,29 @@ def generate_backup(
         metadata: dict[str, Any] = {}
         if wallet.address is not None:
             metadata["address"] = wallet.address
-        keys.append(
-            {
-                "key_name": wallet.name,
-                "shares": [
-                    {
-                        "metadata": metadata,
-                        "encryption": {
-                            "ciphersuite": f"RSA-{rsa_bits}-OAEP-SHA256",
-                            "ciphertext": base64.b64encode(ciphertext).decode("ascii"),
-                            "original_sha256": base64.b64encode(
-                                hashlib.sha256(wallet.plaintext).digest()
-                            ).decode("ascii"),
-                        },
-                    }
-                ],
-            }
-        )
+        if wallet.declare_chain_id and wallet.chain_id in CHAIN_IDS:
+            metadata["chain_id"] = CHAIN_IDS[wallet.chain_id]
+        entry: dict[str, Any] = {
+            "key_name": wallet.name,
+            "shares": [
+                {
+                    "metadata": metadata,
+                    "encryption": {
+                        "ciphersuite": f"RSA-{rsa_bits}-OAEP-SHA256",
+                        "ciphertext": base64.b64encode(ciphertext).decode("ascii"),
+                        "original_sha256": base64.b64encode(
+                            hashlib.sha256(wallet.plaintext).digest()
+                        ).decode("ascii"),
+                        # Real backups record the key the share was encrypted
+                        # to; RecoverySession.open checks it before decrypting.
+                        "public_key": recovery_spki_b64,
+                    },
+                }
+            ],
+        }
+        if wallet.curve:
+            entry["key_type"] = KEY_TYPES[wallet.curve]
+        keys.append(entry)
 
     recovery_key_der = private_key.private_bytes(
         serialization.Encoding.DER,
@@ -283,6 +366,7 @@ def generate_backup(
     )
 
     document = {
+        "version": "1.0",
         "wallet_provider": wallet_provider,
         "recovery_key": base64.b64encode(recovery_key_der).decode("ascii"),
         "keys": keys,

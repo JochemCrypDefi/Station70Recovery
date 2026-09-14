@@ -38,20 +38,4 @@ class EvmChain(ChainSpec):
         return [to_checksum_address(keccak256(key.public_key)[-20:])]
 
 
-SPEC = EvmChain(
-    id="evm",
-    label="EVM",
-    curves=(CURVE_SECP256K1,),
-    wallet="Rabby or MetaMask",
-    address_verifiable=True,
-    supports_signing=False,
-    signing_note=(
-        "Transaction building is deliberately not offered for EVM. There is no "
-        "reliable way to enumerate everything of value at an EVM address: ERC-20 has "
-        "no reverse index, so a scan can only check tokens it already knows to ask "
-        "about, and it would miss LP, staked, vesting, locked and bridged positions "
-        "entirely. A partial sweep that looks complete is worse than no sweep. "
-        "Import the key into Rabby and use its portfolio view across chains instead."
-    ),
-    aliases=("ethereum", "eth"),
-)
+SPEC = EvmChain(id="evm", label="EVM", curves=(CURVE_SECP256K1,))

@@ -46,22 +46,4 @@ class PolkadotChain(ChainSpec):
         return ss58.decode(address)[1]
 
 
-SPEC = PolkadotChain(
-    id="polkadot",
-    label="Polkadot",
-    curves=(CURVE_ED25519,),
-    wallet="Talisman",
-    address_verifiable=True,
-    supports_signing=False,
-    signing_note=(
-        "Transaction building is not offered for Polkadot. Import the generated "
-        "keystore into Talisman and transfer from there."
-    ),
-    import_note=(
-        "Talisman cannot import a raw Substrate private key -- it only accepts raw keys "
-        "for Ethereum and Solana. This tool writes a polkadot-js v3 keystore JSON "
-        "instead, which you import via 'Add account -> Import -> Import from Polkadot.js'. "
-        "Only Ed25519 accounts are supported; sr25519 accounts cannot be rebuilt here."
-    ),
-    aliases=("dot", "substrate", "kusama"),
-)
+SPEC = PolkadotChain(id="polkadot", label="Polkadot", curves=(CURVE_ED25519,))

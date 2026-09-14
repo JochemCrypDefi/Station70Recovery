@@ -30,16 +30,4 @@ class StellarChain(ChainSpec):
         return [strkey.encode_ed25519_public_key(key.public_key)]
 
 
-SPEC = StellarChain(
-    id="stellar",
-    label="Stellar",
-    curves=(CURVE_ED25519,),
-    wallet="Freighter",
-    address_verifiable=True,
-    supports_signing=True,
-    import_note=(
-        "Freighter takes the StrKey secret seed ('S' + 55 chars). It cannot recover an "
-        "imported secret key from its recovery phrase, and says so during import."
-    ),
-    aliases=("xlm",),
-)
+SPEC = StellarChain(id="stellar", label="Stellar", curves=(CURVE_ED25519,))

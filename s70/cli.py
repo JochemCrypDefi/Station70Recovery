@@ -1,19 +1,20 @@
 """Command-line interface.
 
 The TUI is the intended way to use this tool; the CLI exists for the things a
-TUI is bad at -- scripted verification, writing job files, and running in CI
-where nobody is watching.
+TUI is bad at -- scripted verification, exporting to KMS, and running where
+nobody is watching.
 
-No CLI command displays a private key. ``verify`` decrypts every key to check
-it and shows none of them; revealing a key is the TUI's job, because the TUI
-runs on the alternate screen buffer and a terminal's scrollback is not
-something this tool can clean up after.
+**No CLI command displays a private key.** ``verify`` decrypts every key to
+check it and shows none of them, and ``kms-export`` decrypts one key but emits
+only ciphertext, a public key and a list of commands. Revealing a key is the
+TUI's job, because the TUI runs on the alternate screen buffer and a terminal's
+scrollback is not something this tool can clean up after.
 """
 
 from __future__ import annotations
 
 import argparse
-import sys
+from pathlib import Path
 
 from rich.console import Console
 from rich.markup import escape
@@ -21,21 +22,22 @@ from rich.panel import Panel
 from rich.table import Table
 
 from s70 import backup as backup_mod
-from s70 import chains, security, txn, wallets
+from s70 import kms, security
 from s70.errors import S70Error
 from s70.session import RecoverySession, WalletRecord
 
 console = Console(stderr=False)
 error_console = Console(stderr=True)
 
+#: One style per status. The set of keys is exactly :class:`s70.chains.Status`
+#: plus the three non-verdict states a record can be in, and it is mirrored by
+#: ``STATUS_MARKUP`` in the TUI so a status never reads two ways.
 STATUS_STYLES = {
     "verified": "green",
-    "unverifiable": "yellow",
     "mismatch": "red",
     "ambiguous": "yellow",
-    "unsupported": "dim",
-    "no-address": "yellow",
-    "skipped": "dim",
+    "sha-256 only": "cyan",
+    "no address": "yellow",
     "error": "red",
     "HASH MISMATCH": "bold red",
     "not recovered": "dim",
@@ -73,29 +75,6 @@ def _select(session: RecoverySession, selector: str) -> WalletRecord:
     if len(matches) > 1:
         names = ", ".join(f"[{r.share.index}] {r.name}" for r in matches)
         raise S70Error(f"{selector!r} matches several wallets: {names}. Use the index.")
-    return matches[0]
-
-
-def _select_by_address(session: RecoverySession, address: str) -> WalletRecord:
-    """Find the wallet a job file is for, by its recorded address.
-
-    Exact match, case-insensitively: an address is not a search term, and a
-    substring match here would be a way to sign with the wrong account.
-    """
-    needle = address.strip().lower()
-    matches = [r for r in session.records if (r.address or "").lower() == needle]
-    if not matches:
-        raise S70Error(
-            f"no wallet in this backup has the address {address}, which is the "
-            "source this job is for. Check you opened the right backup file, or "
-            "name the wallet explicitly with --wallet."
-        )
-    if len(matches) > 1:
-        indices = ", ".join(str(r.share.index) for r in matches)
-        raise S70Error(
-            f"{address} appears more than once in this backup (wallets {indices}). "
-            "Pick one with --wallet."
-        )
     return matches[0]
 
 
@@ -176,139 +155,213 @@ def cmd_verify(args) -> int:
     console.print(_inventory_table(session, title="Verification results"))
 
     for record in session.records:
+        index = record.share.index
         if record.error:
-            error_console.print(f"[red]![/] [{record.share.index}] {record.name}: {record.error}")
-        elif record.status_label in ("mismatch", "ambiguous", "HASH MISMATCH"):
+            error_console.print(f"[red]![/] [{index}] {record.name}: {record.error}")
+        elif record.integrity_result is False:
+            # Report the check that actually failed. `verdict_detail` describes
+            # the *address* check, which may well have passed, and printing it
+            # here once read as reassurance next to a red HASH MISMATCH.
             error_console.print(
-                f"[yellow]?[/] [{record.share.index}] {record.name}: {record.verdict_detail}"
+                f"[bold red]![/] [{index}] {record.name}: the decrypted key does not "
+                "match the SHA-256 checksum recorded in the backup. Do not import or "
+                "export this key; the ciphertext is damaged."
             )
+        elif record.status_label in ("mismatch", "ambiguous"):
+            error_console.print(f"[yellow]?[/] [{index}] {record.name}: {record.verdict_detail}")
+        if record.scheme_warning:
+            error_console.print(f"[yellow]note:[/] [{index}] {record.name}: {record.scheme_warning}")
 
     console.print()
     console.print(
         f"verified [green]{stats.verified}[/]   "
-        f"unverifiable [yellow]{stats.unverifiable}[/]   "
         f"sha-256 only [cyan]{stats.sha_only}[/]   "
-        f"mismatched [red]{stats.mismatched}[/]   "
+        f"wrong address [red]{stats.mismatched}[/]   "
+        f"hash mismatch [bold red]{stats.hash_mismatch}[/]   "
         f"failed [red]{stats.failed}[/]"
     )
-    return 1 if (stats.failed or stats.mismatched) else 0
+    return 1 if (stats.failed or stats.mismatched or stats.hash_mismatch) else 0
 
 
-def cmd_inspect(args) -> int:
-    """Online phase: read chain state and write a job file."""
-    kwargs = {}
-    if args.rpc_url:
-        kwargs["rpc_url"] = args.rpc_url
-    if args.tx_bytes:
-        kwargs["tx_bytes"] = args.tx_bytes
+def cmd_kms_prepare(args) -> int:
+    """Say which KMS key spec each wallet needs. Decrypts nothing.
 
-    job = txn.inspect(args.chain, args.source, args.destination, **kwargs)
-    path = job.write(args.out)
+    The curve is stated in the backup's ``key_type`` field, and the curve is
+    all that determines the key spec -- so this runs before any key is touched,
+    which is the right order: you have to create the KMS key and fetch its
+    import parameters before ``kms-export`` has anything to work with.
+    """
+    session = _open_session(args)
+    records = [_select(session, args.wallet)] if args.wallet else session.records
 
-    console.print(Panel("\n".join(job.plan) or "(nothing to do)", title="Plan", border_style="cyan"))
+    table = Table(title="KMS key spec per wallet", header_style="bold")
+    table.add_column("#", justify="right", style="dim")
+    table.add_column("Name")
+    table.add_column("Chain")
+    table.add_column("Curve")
+    table.add_column("KMS key spec")
 
-    table = Table(title="Assets", header_style="bold")
-    table.add_column("Symbol")
-    table.add_column("Amount", justify="right")
-    table.add_column("Identifier", style="dim")
-    table.add_column("Note")
-    for asset in job.assets:
+    unknown: list[WalletRecord] = []
+    for record in records:
+        curve = record.entry.declared_curve
+        try:
+            profile = kms.profile_for_curve(curve) if curve else None
+        except S70Error:
+            profile = None
+        if profile is None:
+            unknown.append(record)
         table.add_row(
-            asset.symbol,
-            asset.amount,
-            security.mask(asset.identifier, 12),
-            f"[red]{asset.blocked}[/]" if asset.blocked else "",
+            str(record.share.index),
+            escape(record.name),
+            escape(record.chain_label),
+            escape(curve or "not stated"),
+            profile.key_spec if profile else "[yellow]run kms-export to find out[/]",
         )
     console.print(table)
 
-    checks = Table(title="Preconditions", header_style="bold")
-    checks.add_column("Check")
-    checks.add_column("Result")
-    checks.add_column("Detail", style="dim")
-    for precondition in job.preconditions:
-        style = "green" if precondition.satisfied else ("red" if precondition.blocking else "yellow")
-        checks.add_row(
-            precondition.name,
-            f"[{style}]{precondition.symbol}[/]",
-            precondition.detail,
+    if unknown:
+        error_console.print(
+            f"[yellow]note:[/] {len(unknown)} wallet(s) do not state a curve in the "
+            "backup. Their key spec is decided by the decrypted key, so run "
+            "`s70 kms-export` for those and it will tell you before it wraps anything."
         )
-    console.print(checks)
 
-    for warning in job.warnings:
-        error_console.print(f"[yellow]note:[/] {warning}")
+    # The commands only differ by key spec, so show each distinct one once
+    # rather than repeating an identical block 34 times.
+    seen: set[str] = set()
+    for record in records:
+        curve = record.entry.declared_curve
+        if not curve:
+            continue
+        try:
+            profile = kms.profile_for_curve(curve)
+        except S70Error:
+            continue
+        if profile.key_spec in seen:
+            continue
+        seen.add(profile.key_spec)
+        # Name the wallet only when one was asked for: with several wallets
+        # sharing a key spec, a single block is printed for all of them and
+        # naming one of them in it would be wrong.
+        steps = kms.key_spec_steps(
+            profile,
+            region=args.region,
+            wallet_name=record.name if args.wallet else "",
+        )
+        console.print()
+        console.print(
+            kms.KmsGuide(steps=steps).render(),
+            markup=False,
+            highlight=False,
+            # soft_wrap: rich would otherwise insert real newlines to fit the
+            # terminal, breaking these commands mid-token. A command you cannot
+            # copy is no use, and the prose is already wrapped by render().
+            soft_wrap=True,
+        )
 
     console.print()
-    console.print(f"[green]wrote[/] {path}")
-    if job.ready:
-        console.print(f"Next: s70 sign --job {path} --backup <backup.json>")
-    else:
-        error_console.print(
-            "[red]This job is not ready to sign.[/] Resolve the blocked preconditions "
-            "above and re-run inspect."
+    console.print(
+        "Then, on this machine:  s70 kms-export --backup <backup.json> "
+        "--wallet <n> --params import-parameters.json --out EncryptedKeyMaterial.bin"
+    )
+    return 0
+
+
+def cmd_kms_export(args) -> int:
+    """Wrap one recovered key as KMS importable key material. Opens no sockets."""
+    params = kms.load_import_parameters(
+        args.params, wrapping_algorithm=args.wrapping_algorithm
+    )
+
+    valid_to = (
+        params.parameters_valid_to.isoformat()
+        if params.parameters_valid_to
+        else "not stated"
+    )
+    console.print(
+        Panel(
+            f"Source           : {params.source}\n"
+            f"Wrapping key     : RSA-{params.rsa_key_size}\n"
+            f"Wrapping algo    : {params.wrapping_algorithm} "
+            f"(from {params.algorithm_source})\n"
+            f"KMS key          : {params.key_id or '<not stated>'}\n"
+            f"Valid to         : {valid_to}\n"
+            f"Import token     : {len(params.import_token or b'')} bytes",
+            title="KMS import parameters",
+            border_style="cyan",
         )
-    return 0 if job.ready else 1
-
-
-def cmd_sign(args) -> int:
-    """Offline phase: sign a job file. Opens no sockets."""
-    job = txn.TransferJob.read(args.job)
-
-    stale = job.staleness_warning
-    if stale:
-        error_console.print(f"[yellow]warning:[/] {stale}")
+    )
+    # The guide repeats these at the end, where the user will still be looking
+    # when they act on them. Printing them here as well only taught the reader
+    # that the second copy is redundant.
+    # Where the import token will go. The generated `import-key-material`
+    # command needs it as raw bytes beside the blob, so it is written on every
+    # run rather than on request -- the command used to name a file that only
+    # existed if you had thought to ask for it.
+    token_path = (
+        Path(args.write_import_token).expanduser()
+        if args.write_import_token
+        else Path(args.out).expanduser().parent / kms.CONSOLE_TOKEN_NAME
+    )
+    # Check before wrapping: a collision found afterwards leaves a blob behind.
+    kms.check_import_token_destination(token_path, params)
 
     session = _open_session(args)
-    if args.wallet:
-        record = _select(session, args.wallet)
-    else:
-        # The job already names the account it is for. Selecting the wallet by
-        # hand is a chance to pick the wrong one, and every signer would then
-        # refuse anyway -- so resolve it from the job and say which one it is.
-        record = _select_by_address(session, job.source_address)
-        console.print(
-            f"Signing as [{record.share.index}] {escape(record.name)} "
-            f"({escape(record.chain_label)}), matched on the job's source address."
-        )
-    record = session.recover(record)
+    record = session.recover(_select(session, args.wallet))
 
     if record.error:
         error_console.print(f"[red]error:[/] {record.error}")
         return 1
-
-    key = record.key
-    if key is None:
+    if record.key is None:
         error_console.print("[red]error:[/] this wallet's key could not be identified")
         return 1
 
-    kwargs = {}
-    if args.tx_bytes:
-        kwargs["tx_bytes"] = args.tx_bytes
-
-    bundle = txn.sign(job, key, **kwargs)
-
     console.print(
-        Panel("\n".join(bundle.summary), title="What this signs", border_style="yellow")
+        f"Wrapping [{record.share.index}] {escape(record.name)} "
+        f"({escape(record.chain_label)}, {escape(record.key.curve)})"
     )
+    if not record.address_proved:
+        error_console.print(
+            f"[yellow]warning:[/] this key was not proved to control "
+            f"{escape(record.address or '<no address>')} -- {escape(record.verdict_detail)}. "
+            "The key itself is intact; confirm with the public-key check below before "
+            "you rely on the KMS key."
+        )
+    if record.scheme_warning:
+        error_console.print(f"[yellow]warning:[/] {escape(record.scheme_warning)}")
 
-    for index, blob in enumerate(bundle.blobs, start=1):
-        console.print()
-        console.print(f"[bold]Blob {index}/{len(bundle.blobs)}[/] ({bundle.encoding})")
-        console.print(blob, markup=False, highlight=False)
+    try:
+        result = kms.write_encrypted_key_material(
+            args.out, record.key, params, key_spec=args.key_spec
+        )
+    finally:
+        # The key is not needed past the wrap, and this command would otherwise
+        # sit on one for the length of a long printout.
+        session.forget(record)
+
+    written_token = (
+        kms.write_import_token(token_path, params)
+        if params.import_token is not None
+        else None
+    )
+    if written_token is None:
+        error_console.print(
+            "[yellow]warning:[/] these import parameters carry no import token, so "
+            "one could not be written. `import-key-material` needs the ImportToken "
+            "from the same download as the wrapping public key -- supply it yourself."
+        )
 
     console.print()
-    console.print("[bold]Submit with[/]")
-    console.print(bundle.submit_command, markup=False, highlight=False)
-    for note in bundle.submit_notes:
-        console.print(f"  - {note}")
-    if bundle.expires_note:
-        error_console.print(f"[yellow]expiry:[/] {bundle.expires_note}")
-
-    if args.out:
-        path = bundle.write(args.out)
-        console.print(f"\n[green]wrote[/] {path}")
-
     console.print(
-        "\n[bold]This tool did not submit anything.[/] Nothing has moved on chain yet."
+        kms.build_guide(
+            result, params, key_id=args.key_id, token_path=written_token
+        ).render(),
+        # markup=False is load-bearing: ARNs and the JSON braces in these
+        # commands would otherwise be eaten by rich's markup parser.
+        # soft_wrap keeps rich from breaking a command mid-token.
+        markup=False,
+        highlight=False,
+        soft_wrap=True,
     )
     return 0
 
@@ -329,7 +382,10 @@ def cmd_tui(args) -> int:
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="s70",
-        description="Recover CrypDefi wallet backup keys and prepare transfers.",
+        description=(
+            "Recover wallet keys from a Station70 backup, show them in importable "
+            "form, and export them to AWS KMS."
+        ),
         epilog="Run `s70 tui <backup.json>` for the interactive interface.",
     )
     subparsers = parser.add_subparsers(dest="command")
@@ -338,8 +394,8 @@ def build_parser() -> argparse.ArgumentParser:
         if positional:
             sub.add_argument("backup", help="path to the backup JSON file")
         else:
-            # `sign` already takes --job, so a bare positional path would be
-            # ambiguous to read on the command line.
+            # `kms-export` already takes --params and --out, so a bare
+            # positional path would be ambiguous to read on the command line.
             sub.add_argument(
                 "--backup", required=True, help="path to the backup JSON file"
             )
@@ -358,30 +414,76 @@ def build_parser() -> argparse.ArgumentParser:
     add_backup_args(verify)
     verify.set_defaults(func=cmd_verify)
 
-    inspect = subparsers.add_parser(
-        "inspect", help="ONLINE: read chain state and write a job file (no keys loaded)"
+    prepare = subparsers.add_parser(
+        "kms-prepare",
+        help="which AWS KMS key spec each wallet needs, and how to create it",
+        description=(
+            "Run this first. It decrypts nothing -- the curve comes from the backup's "
+            "key_type field -- and prints the `aws kms create-key` and "
+            "`get-parameters-for-import` commands you need to run online before "
+            "`kms-export` has anything to wrap."
+        ),
     )
-    inspect.add_argument("--chain", required=True, choices=sorted(txn.SUPPORTED))
-    inspect.add_argument("--source", required=True, help="the compromised/abandoned address")
-    inspect.add_argument("--destination", required=True, help="the safe address to sweep to")
-    inspect.add_argument("--out", required=True, help="output path for the job file")
-    inspect.add_argument("--rpc-url", help="override the default RPC endpoint")
-    inspect.add_argument("--tx-bytes", help="Sui only: base64 unsigned transaction bytes")
-    inspect.set_defaults(func=cmd_inspect)
+    add_backup_args(prepare)
+    prepare.add_argument(
+        "--wallet", help="index, name, or address substring. Default: every wallet."
+    )
+    prepare.add_argument("--region", help="fill this AWS region into the commands")
+    prepare.set_defaults(func=cmd_kms_prepare)
 
-    sign = subparsers.add_parser(
-        "sign", help="OFFLINE: sign a job file. Never submits."
+    export = subparsers.add_parser(
+        "kms-export",
+        help="OFFLINE: wrap one key as AWS KMS importable key material",
+        description=(
+            "Wraps one recovered private key for `aws kms import-key-material`. Opens "
+            "no sockets and displays no key material -- the blob it writes is "
+            "encrypted to AWS's HSM public key."
+        ),
     )
-    add_backup_args(sign, positional=False)
-    sign.add_argument("--job", required=True, help="job file from `s70 inspect`")
-    sign.add_argument(
-        "--wallet",
-        help="index, name, or address substring. Defaults to the wallet whose "
-        "address matches the job's source.",
+    add_backup_args(export, positional=False)
+    export.add_argument(
+        "--wallet", required=True, help="index, name, or address substring"
     )
-    sign.add_argument("--out", help="also write the signed bundle to this path")
-    sign.add_argument("--tx-bytes", help="Sui only: base64 unsigned transaction bytes")
-    sign.set_defaults(func=cmd_sign)
+    export.add_argument(
+        "--params",
+        required=True,
+        help="KMS import parameters: the console download (folder or zip), or the "
+        "JSON from `aws kms get-parameters-for-import`",
+    )
+    export.add_argument(
+        "--out",
+        default="EncryptedKeyMaterial.bin",
+        help="where to write the wrapped blob (default: %(default)s)",
+    )
+    # Both of these default to None rather than to their real defaults: the
+    # wrapping algorithm may come from the bundle's README, and the key spec
+    # from the key's curve, and an argparse default would silently pre-empt
+    # either -- or trigger a spurious conflict error against the README.
+    export.add_argument(
+        "--wrapping-algorithm",
+        default=None,
+        choices=list(kms.WRAPPING_ALGORITHMS),
+        help="the algorithm the import parameters were fetched with. Read from the "
+        f"console download's README.txt when present, else {kms.DEFAULT_WRAPPING_ALGORITHM}.",
+    )
+    export.add_argument(
+        "--key-spec",
+        default=None,
+        choices=[kms.KEYSPEC_SECP256K1, kms.KEYSPEC_ED25519],
+        help="assert the KMS key spec. Refused if it contradicts the key's curve; "
+        "omit it and the curve decides.",
+    )
+    export.add_argument(
+        "--key-id", help="KMS key id or ARN, to fill into the printed commands"
+    )
+    export.add_argument(
+        "--write-import-token",
+        metavar="PATH",
+        help="write the decoded import token here instead of beside --out. It is "
+        "written either way: `import-key-material` needs it as raw bytes, and the "
+        "printed command points at it.",
+    )
+    export.set_defaults(func=cmd_kms_export)
 
     return parser
 

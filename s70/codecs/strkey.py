@@ -87,8 +87,5 @@ def encode_ed25519_secret_seed(seed: bytes) -> str:
 
 
 def decode_ed25519_public_key(text: str) -> bytes:
+    """``G...`` account id -> 32-byte Ed25519 public key. Validates the CRC16."""
     return decode(VERSION_ED25519_PUBLIC_KEY, text)
-
-
-def decode_ed25519_secret_seed(text: str) -> bytes:
-    return decode(VERSION_ED25519_SECRET_SEED, text)

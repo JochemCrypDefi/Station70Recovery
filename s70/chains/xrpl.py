@@ -8,17 +8,19 @@ seed** (``s...`` for secp256k1, ``sEd...`` for Ed25519), a mnemonic, or secret
 numbers. All three encode the same **16 bytes of entropy**. The account's
 32-byte private key is *derived* from that entropy by a one-way function.
 
-So if the backup stores 16 bytes we can produce an importable family seed. If
-it stores a 32-byte derived private key -- which is the more likely case --
-then **no XRPL wallet can import it**, and the only routes to the funds are
+This backup format stores the derived 32-byte private key, never the entropy
+(:func:`s70.keymaterial.parse_candidates` rejects a 16-byte plaintext), so
+**no XRPL wallet can import these keys** and no amount of re-encoding will
+change that. The only routes to the funds are
 
-* sign transactions offline with the raw key (phase 2 of this tool does this,
-  because xrpl-py's low-level signing accepts a private key directly), or
+* export the key to AWS KMS (``s70 kms-export``) and sign with it there. XRPL
+  uses secp256k1 and Ed25519, and KMS imports both, so this works for every
+  XRPL key in the backup, or
 * use the key as a regular key via ``SetRegularKey`` on an account you still
   control.
 
-Address derivation works either way, so chain detection and key verification
-are unaffected.
+Address derivation runs from the private key, so chain detection and key
+verification are unaffected by any of this.
 """
 
 from __future__ import annotations
@@ -68,18 +70,5 @@ class XrplChain(ChainSpec):
 
 
 SPEC = XrplChain(
-    id="xrpl",
-    label="XRPL",
-    curves=(CURVE_SECP256K1, CURVE_ED25519),
-    # No extension can take this key: they all import a 16-byte family seed,
-    # and the seed-to-key derivation is one-way. Offline signing is the route.
-    wallet="(offline signing only)",
-    address_verifiable=True,
-    supports_signing=True,
-    import_note=(
-        "XRPL wallet extensions import a 16-byte family seed, not the 32-byte private "
-        "key this backup holds. No extension can import it -- use the offline signing "
-        "flow instead."
-    ),
-    aliases=("xrp", "ripple"),
+    id="xrpl", label="XRPL", curves=(CURVE_SECP256K1, CURVE_ED25519)
 )

@@ -77,7 +77,7 @@ def test_strkey_secret_seed_shape():
     assert len(encoded) == 56
     assert encoded.startswith("S")
     assert "=" not in encoded  # 35 bytes is exactly 56 base32 chars
-    assert strkey.decode_ed25519_secret_seed(encoded) == SAMPLE
+    assert strkey.decode(strkey.VERSION_ED25519_SECRET_SEED, encoded) == SAMPLE
 
 
 def test_strkey_public_key_shape():
@@ -94,14 +94,14 @@ def test_strkey_version_bytes_are_distinct():
 def test_strkey_rejects_wrong_version_byte():
     public = strkey.encode_ed25519_public_key(SAMPLE)
     with pytest.raises(ValueError, match="version byte"):
-        strkey.decode_ed25519_secret_seed(public)
+        strkey.decode(strkey.VERSION_ED25519_SECRET_SEED, public)
 
 
 def test_strkey_rejects_bad_checksum():
     encoded = list(strkey.encode_ed25519_secret_seed(SAMPLE))
     encoded[-1] = "A" if encoded[-1] != "A" else "B"
     with pytest.raises(ValueError):
-        strkey.decode_ed25519_secret_seed("".join(encoded))
+        strkey.decode(strkey.VERSION_ED25519_SECRET_SEED, "".join(encoded))
 
 
 def test_strkey_rejects_wrong_length_payload():
@@ -114,24 +114,67 @@ def test_strkey_rejects_wrong_length_payload():
 # --------------------------------------------------------------------------
 
 
+#: BIP-173 checksum constant. Sui uses this one; 0x2BC830A3 is bech32m, which
+#: produces a string that still starts "suiprivkey1" and then fails inside the
+#: wallet -- so which constant we emit is worth pinning independently.
+_BECH32_CONST = 1
+_BECH32M_CONST = 0x2BC830A3
+
+
+def _reference_residue(text: str) -> int:
+    """Recompute the BIP-173 polymod residue of a bech32 string from scratch.
+
+    Written out here rather than imported: the point is to check the encoder
+    against the spec, not against itself. `s70.codecs.bech32` encodes only, so
+    this is the only decoder in the project and it lives in the tests.
+    """
+    generator = [0x3B6A57B2, 0x26508E6D, 0x1EA119FA, 0x3D4233DD, 0x2A1462B3]
+    pos = text.rfind("1")
+    hrp, data_part = text[:pos], text[pos + 1 :]
+    values = (
+        [ord(c) >> 5 for c in hrp]
+        + [0]
+        + [ord(c) & 31 for c in hrp]
+        + [bech32.CHARSET.index(c) for c in data_part]
+    )
+    chk = 1
+    for value in values:
+        top = chk >> 25
+        chk = ((chk & 0x1FFFFFF) << 5) ^ value
+        for i in range(5):
+            chk ^= generator[i] if ((top >> i) & 1) else 0
+    return chk
+
+
 def test_suiprivkey_shape():
     encoded = bech32.encode_bytes("suiprivkey", b"\x00" + SAMPLE)
     # 10 hrp + 1 separator + 53 data + 6 checksum
     assert len(encoded) == 70
     assert encoded.startswith("suiprivkey1")
     assert encoded == encoded.lower()
-    hrp, payload = bech32.decode_bytes(encoded)
-    assert hrp == "suiprivkey"
-    assert payload == b"\x00" + SAMPLE
 
 
-def test_bech32_and_bech32m_are_not_interchangeable():
-    plain = bech32.encode_bytes("suiprivkey", b"\x00" + SAMPLE)
-    variant = bech32.encode_bytes("suiprivkey", b"\x00" + SAMPLE, bech32m=True)
-    assert plain != variant
-    # Sui uses plain bech32; decoding it as bech32m must fail.
-    with pytest.raises(ValueError, match="checksum"):
-        bech32.decode_bytes(plain, bech32m=True)
+def test_sui_keys_are_bech32_not_bech32m():
+    """The wrong constant yields a string Suiet accepts the shape of and rejects."""
+    encoded = bech32.encode_bytes("suiprivkey", b"\x00" + SAMPLE)
+    assert _reference_residue(encoded) == _BECH32_CONST
+    assert _reference_residue(encoded) != _BECH32M_CONST
+
+
+def test_bech32_payload_survives_the_round_trip():
+    """Regroup the 5-bit data back to bytes and check it is the key we gave."""
+    payload = b"\x00" + SAMPLE
+    encoded = bech32.encode_bytes("suiprivkey", payload)
+    data = [bech32.CHARSET.index(c) for c in encoded[len("suiprivkey1") :]][:-6]
+    acc = bits = 0
+    out = bytearray()
+    for value in data:
+        acc = (acc << 5) | value
+        bits += 5
+        if bits >= 8:
+            bits -= 8
+            out.append((acc >> bits) & 0xFF)
+    assert bytes(out) == payload
 
 
 def test_sui_flag_byte_changes_the_string():
@@ -140,15 +183,11 @@ def test_sui_flag_byte_changes_the_string():
     assert ed != k1
 
 
-def test_bech32_rejects_mixed_case():
+def test_bech32_output_is_all_lowercase():
+    """Mixed case is invalid bech32, so the encoder must never produce it."""
     encoded = bech32.encode_bytes("suiprivkey", b"\x00" + SAMPLE)
-    # Uppercase the HRP, not the last character: the final char is a checksum
-    # symbol that may already be a digit, in which case .upper() is a no-op
-    # and the string never becomes mixed case at all.
-    mixed = encoded[:1].upper() + encoded[1:]
-    assert mixed != encoded
-    with pytest.raises(ValueError, match="mixed case"):
-        bech32.decode(mixed)
+    assert encoded == encoded.lower()
+    assert not any(c.isupper() for c in encoded)
 
 
 # --------------------------------------------------------------------------
